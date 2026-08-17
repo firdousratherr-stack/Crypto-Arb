@@ -2,6 +2,8 @@ import asyncio
 import os
 import sqlite3
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone, timedelta
 import ccxt.async_support as ccxt_async
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -540,7 +542,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = get_user_settings(uid)
     if not settings: return await message.reply_text("Settings not found.")
 
-    status = await message.reply_text("🔍 Scanning markets across 17 exchanges...")
+    status = await message.reply_text(f"🔍 Scanning markets across {len(ccxt_instances)} exchanges...")
     results = await scan_all_symbols(
         min_profit=settings['min_net_profit_usd'], min_spread=settings['min_spread_pct'],
         max_spread=settings['max_spread_pct'], symbols=list(settings['watchlist']) if settings['watchlist'] else None,
@@ -683,7 +685,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 `/setmaxresults 15` - Set max results to show
 
 🔔 **Watchlist & Alerts**
-`/watch BTC/USDT` - Add coin to watchlist (filters scan to watchlist only)
+`/watch BTC/USDT` - Add coin to watchlist
 `/unwatch BTC/USDT` - Remove coin from watchlist
 `/pause` - Pause background alerts
 `/resume` - Resume background alerts"""
@@ -808,21 +810,23 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
-# 6. CLOUD PORT FIX / HEALTH SERVER
+# 6. CLOUD PORT FIX / HEALTH SERVER (THREADED)
 # ==========================================
-async def cloud_health_handler(reader, writer):
-    await reader.read(1024)
-    response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nBot is running healthy!\n"
-    writer.write(response.encode('utf8'))
-    await writer.drain()
-    writer.close()
-    await writer.wait_closed()
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is healthy!")
+        
+    def log_message(self, format, *args):
+        pass # Suppress logging to keep console clean
 
-async def start_cloud_health_server():
+def run_health_server():
     port = int(os.environ.get("PORT", 8080))
-    server = await asyncio.start_server(cloud_health_handler, '0.0.0.0', port)
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     print(f"✅ Cloud Health-Check Server listening on port {port}")
-    return server
+    server.serve_forever()
 
 
 # ==========================================
@@ -920,9 +924,7 @@ async def post_init(app):
     ]
     await app.bot.set_my_commands(commands)
     print("✅ Command menu registered")
-    
     asyncio.create_task(background_arbitrage_daemon(app))
-    asyncio.create_task(start_cloud_health_server())
 
 async def post_shutdown(app):
     for o in ccxt_instances.values():
@@ -931,6 +933,10 @@ async def post_shutdown(app):
 
 def main():
     init_db()
+    
+    # Start the robust threaded web server for Render health checks
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
     app = (ApplicationBuilder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout(30).post_init(post_init).post_shutdown(post_shutdown).build())
 
     handlers = [

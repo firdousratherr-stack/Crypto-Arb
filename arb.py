@@ -27,6 +27,7 @@ DEFAULT_MIN_PROFIT_USER = 5.0
 DEFAULT_MIN_SPREAD_PCT = 0.5
 DEFAULT_MAX_SPREAD_PCT = 50.0
 DEFAULT_MAX_RESULTS = 15
+SCAN_CONCURRENCY = 12
 
 MIN_24H_VOLUME_USD = 40000
 GENERIC_WITHDRAW_FEE_COIN_UNITS = 1.0
@@ -300,7 +301,7 @@ def get_user_full_info(user_id: int):
     }
 
 # ==========================================
-# 3. MARKET ENGINE (Bulk Fetch Optimization)
+# 3. MARKET ENGINE (Optimized)
 # ==========================================
 _exchanges_to_init = {
     'gate': {'enableRateLimit': True, 'timeout': 30000, 'options': {'defaultType': 'spot'}},
@@ -323,10 +324,6 @@ _exchanges_to_init = {
 }
 
 ccxt_instances = {}
-for ex_id, config in _exchanges_to_init.items():
-    if hasattr(ccxt_async, ex_id):
-        ccxt_instances[ex_id] = getattr(ccxt_async, ex_id)(config)
-
 init_semaphore = asyncio.Semaphore(4) 
 
 async def _load_single_exchange(name, obj):
@@ -344,8 +341,8 @@ async def _load_single_exchange(name, obj):
                 is_active = m.get('active') is not False
                 if is_spot and is_usdt and is_active:
                     spot_symbols.add(s)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Failed to load markets for {name}: {e}")
 
         try:
             currencies = await asyncio.wait_for(obj.fetch_currencies(), timeout=20.0)
@@ -403,12 +400,11 @@ async def load_universal_symbols():
     UNIVERSAL_SYMBOLS = sorted(SYMBOL_EXCHANGE_MAP.keys())
     print(f"✅ Loaded {len(UNIVERSAL_SYMBOLS)} universal pairs across active exchanges.")
 
-# --- THE BULK FETCH OPTIMIZATION ---
 async def fetch_all_market_prices():
-    """Fetches ALL prices from all exchanges in exactly 16 API calls instead of 10,000+"""
     async def _fetch_bulk(name, obj):
         try:
-            tkrs = await asyncio.wait_for(obj.fetch_tickers(), timeout=15.0)
+            # Replaced 10,000 individual calls with 1 bulk call per exchange
+            tkrs = await asyncio.wait_for(obj.fetch_tickers(), timeout=25.0)
             return name, tkrs
         except Exception:
             return name, {}
@@ -432,7 +428,6 @@ async def fetch_all_market_prices():
                 prices_map[sym] = {}
             prices_map[sym][name] = float(last)
             
-    # Only return pairs that have prices on at least 2 exchanges
     return {sym: p for sym, p in prices_map.items() if len(p) >= 2}
 
 def can_transfer(coin: str, buy_ex: str, sell_ex: str) -> bool:
@@ -506,7 +501,7 @@ async def get_orderbook_text(symbol: str) -> str:
     lines = [f"📖 **Order Book: {symbol}**\n"]
     for name in known:
         try:
-            ob = await ccxt_instances[name].fetch_order_book(symbol, limit=6)
+            ob = await asyncio.wait_for(ccxt_instances[name].fetch_order_book(symbol, limit=6), timeout=5.0)
             lines.append(f"**{name.upper()}**\nBuy (Bids):")
             for p, v in ob.get('bids', [])[:5]: lines.append(f"`{p:.5f}` × {v:.4f}")
             lines.append("Sell (Asks):")
@@ -583,7 +578,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = get_user_settings(uid)
     if not settings: return await message.reply_text("Settings not found.")
 
-    status = await message.reply_text(f"🔍 Scanning markets across {len(ccxt_instances)} exchanges (Bulk Fetch)...")
+    status = await message.reply_text(f"🔍 Scanning markets across {len(ccxt_instances)} exchanges...")
     
     start_time = time.time()
     results = await scan_all_symbols(
@@ -920,6 +915,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"Error caught in telegram dispatcher: {context.error}")
 
 async def background_arbitrage_daemon(app):
+    # Wait a few seconds for the bot to fully initialize before starting the heavy load
+    await asyncio.sleep(5)
+    await load_universal_symbols()
     last_refresh = time.time()
 
     while True:
@@ -965,11 +963,16 @@ async def post_init(app):
         BotCommand("resume", "Resume alerts"), BotCommand("help", "Show all commands"),
     ]
     await app.bot.set_my_commands(commands)
-    print("✅ Command menu registered")
     
-    # Load markets in parallel immediately before starting the bot loop
-    await load_universal_symbols()
+    # Safely initialize CCXT exchanges inside the active Asyncio loop to prevent silent aiohttp hangs
+    global ccxt_instances
+    for ex_id, config in _exchanges_to_init.items():
+        if hasattr(ccxt_async, ex_id):
+            ccxt_instances[ex_id] = getattr(ccxt_async, ex_id)(config)
+            
+    print("✅ Command menu registered & CCXT bindings secure")
     
+    # Start the background daemon which will handle loading the markets
     asyncio.create_task(background_arbitrage_daemon(app))
 
 async def post_shutdown(app):
@@ -1003,7 +1006,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_router))
     app.add_error_handler(error_handler)
 
-    print("Bot started (Optimized Bulk Fetch Engine Active)...")
+    print("Bot started (Fully unblocked startup engine active)...")
     app.run_polling()
 
 if __name__ == "__main__":

@@ -1,3 +1,7 @@
+Here is the complete, fully corrected arb.py code.
+To make it completely "copy-paste proof" and prevent that SyntaxError: unterminated f-string literal from ever happening again, I have changed all the multi-line messages (like the start, help, and filters text) to use Python's triple-quote block strings (f"""..."""). This makes the text format safely without relying on fragile quotation marks at the end of every single line.
+I also kept the Render port fix and the environment variable setup so it will deploy smoothly.
+Complete arb.py
 import asyncio
 import os
 import sqlite3
@@ -15,8 +19,9 @@ from telegram.ext import (
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-BOT_TOKEN = "8848406877:AAHuBsI_IXmFTvVg8EKu-r7XZm9Gy9uYTfA"          # ← Replace with your real token
-ADMIN_SECRET = "X"
+# We use os.environ.get to safely load tokens from Render, with your token as a fallback.
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8848406877:AAHuBsI_IXmFTvVg8EKu-r7XZm9Gy9uYTfA")
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "X")
 
 SCAN_INTERVAL_SECONDS = 30
 DEFAULT_TRADE_SIZE_USD = 100.0
@@ -371,7 +376,6 @@ def calculate_net_arbitrage(symbol: str, prices: dict, trade_size_usd: float, lo
     buy_price = prices[buy_ex]
     sell_price = prices[sell_ex]
 
-    # LOOSE MODE: If True, completely ignores the withdrawal/deposit & contract match checks.
     if not loose_mode:
         if not can_transfer(base, buy_ex, sell_ex): return None
         if not contracts_match(base, buy_ex, sell_ex): return None
@@ -393,24 +397,28 @@ def calculate_net_arbitrage(symbol: str, prices: dict, trade_size_usd: float, lo
 
 def format_detailed_alert(arb: dict) -> str:
     loose_warn = "\n⚠️ **LOOSE MODE ACTIVE: Verify deposits & contracts manually!**\n" if arb.get('loose_mode') else ""
-    return (
-        f"🚨 **HIGH-MARGIN ARBITRAGE**{loose_warn}\n\n"
-        f"**Pair:** `{arb['symbol']}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 **BUY**\n   Exchange : `{arb['buy_ex']}`\n   Price    : `${arb['buy_price']:.6f}`\n\n"
-        f"🔴 **SELL**\n   Exchange : `{arb['sell_ex']}`\n   Price    : `${arb['sell_price']:.6f}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 **Profit Breakdown**\n"
-        f"• Gross Profit   : `${arb['gross_profit']:.2f}`\n"
-        f"• Trading Fees   : `- ${arb['buy_fee'] + arb['sell_fee']:.2f}`\n"
-        f"• Withdrawal Fee : `- ${arb['withdraw_fee']:.2f}`\n"
-        f"• **Net Profit** : `${arb['net_profit']:.2f}`\n"
-        f"• **Net Spread** : `{arb['net_spread_pct']:.2f}%`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 **Extra Details**\n"
-        f"• Trade Size     : `${arb['trade_size']:.2f}`\n"
-        f"• Coin Amount    : `{arb['coin_amount']:.6f}`\n"
-    )
+    return f"""🚨 **HIGH-MARGIN ARBITRAGE**{loose_warn}
+
+**Pair:** `{arb['symbol']}`
+━━━━━━━━━━━━━━━━━━━━
+🟢 **BUY**
+   Exchange : `{arb['buy_ex']}`
+   Price    : `${arb['buy_price']:.6f}`
+
+🔴 **SELL**
+   Exchange : `{arb['sell_ex']}`
+   Price    : `${arb['sell_price']:.6f}`
+━━━━━━━━━━━━━━━━━━━━
+📊 **Profit Breakdown**
+• Gross Profit   : `${arb['gross_profit']:.2f}`
+• Trading Fees   : `- ${arb['buy_fee'] + arb['sell_fee']:.2f}`
+• Withdrawal Fee : `- ${arb['withdraw_fee']:.2f}`
+• **Net Profit** : `${arb['net_profit']:.2f}`
+• **Net Spread** : `{arb['net_spread_pct']:.2f}%`
+━━━━━━━━━━━━━━━━━━━━
+📋 **Extra Details**
+• Trade Size     : `${arb['trade_size']:.2f}`
+• Coin Amount    : `{arb['coin_amount']:.6f}`"""
 
 async def get_orderbook_text(symbol: str) -> str:
     known = list(SYMBOL_EXCHANGE_MAP.get(symbol, ccxt_instances.keys()))[:3]
@@ -466,7 +474,410 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_user_premium(uid):
         kb = [[InlineKeyboardButton("⚡ Run Scan", callback_data="run_manual_scan"), InlineKeyboardButton("⚙️ Filters", callback_data="show_filters")]]
-        text = (
-            f"👑 **Arbitrage Terminal Active**\n\nTracked pairs: `{len(UNIVERSAL_SYMBOLS)}`\n"
-            f"Exchanges: Gate • LBank • Bitrue • XT\n\n📌 **Quick Commands:**\n"
-            f"`/scan` 
+        
+        # Using a triple-quote multi-line string to prevent syntax errors
+        text = f"""👑 **Arbitrage Terminal Active**
+
+Tracked pairs: `{len(UNIVERSAL_SYMBOLS)}`
+Exchanges: Gate • LBank • Bitrue • XT
+
+📌 **Quick Commands:**
+`/scan` - Find opportunities
+`/filters` - View settings
+`/loosemode` - Toggle contract verification
+`/portfolio` - Paper trading stats
+`/help` - Full command list"""
+
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else:
+        await update.message.reply_text("🔒 **Access Required**\n\nUse:\n`/register YOUR_KEY`", parse_mode="Markdown")
+
+async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    log_action(uid, "/register")
+    if not context.args: return await update.message.reply_text("⚠️ Usage:\n`/register YOUR_KEY`", parse_mode="Markdown")
+    if activate_user_key(uid, update.effective_user.username or "Anon", context.args[0]):
+        await update.message.reply_text("🎉 **Registration Successful!** Type `/start` to begin.", parse_mode="Markdown")
+    else: await update.message.reply_text("❌ Invalid or already used key.")
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message or update.callback_query.message
+    if update.callback_query: await update.callback_query.answer()
+    
+    uid = update.effective_user.id
+    log_action(uid, "/scan")
+    if not is_user_premium(uid): return await message.reply_text("🔒 Premium required.")
+
+    settings = get_user_settings(uid)
+    if not settings: return await message.reply_text("Settings not found.")
+
+    status = await message.reply_text("🔍 Scanning markets...")
+    results = await scan_all_symbols(
+        min_profit=settings['min_net_profit_usd'], min_spread=settings['min_spread_pct'],
+        max_spread=settings['max_spread_pct'], symbols=list(settings['watchlist']) if settings['watchlist'] else None,
+        trade_size=settings['trade_size_usd'], loose_mode=settings['loose_mode']
+    )
+
+    if not results: return await status.edit_text("No opportunities found. Relax filters or try `/loosemode`.")
+
+    top = results[:settings['max_results']]
+    await status.edit_text(f"📊 Found **{len(results)}** opportunities (showing {len(top)})")
+
+    for i, arb in enumerate(top, 1):
+        text = f"**#{i}**\n" + format_detailed_alert(arb)
+        kb = [[InlineKeyboardButton("📖 View Order Book", callback_data=f"ob:{arb['symbol']}")],
+              [InlineKeyboardButton("🎮 Paper Trade This!", callback_data=f"pt:{arb['net_profit']:.2f}")]]
+        try:
+            await message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+            await asyncio.sleep(0.35)
+        except: pass
+
+async def loosemode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    log_action(uid, "/loosemode")
+    if not is_user_premium(uid): return await update.message.reply_text("🔒 Premium required.")
+    
+    if toggle_loose_mode_db(uid):
+        await update.message.reply_text("🔓 **Loose Mode ENABLED**\nBot will skip network & contract checks. You must verify manually before trading!")
+    else:
+        await update.message.reply_text("🔒 **Loose Mode DISABLED**\nBot is now verifying deposits, withdrawals, and contract matches.")
+
+async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    log_action(uid, "/portfolio")
+    if not is_user_premium(uid): return await update.message.reply_text("🔒 Premium required.")
+    
+    settings = get_user_settings(uid)
+    await update.message.reply_text(f"🎮 **Your Paper Trading Portfolio**\n\nTotal Virtual Profit: **${settings['paper_balance']:.2f}**\n\nUse `/leaderboard` to see top traders!", parse_mode="Markdown")
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_user_premium(update.effective_user.id): return await update.message.reply_text("🔒 Premium required.")
+    leaders = get_paper_leaderboard()
+    if not leaders: return await update.message.reply_text("No paper trades recorded yet!")
+    lines = ["🏆 **Paper Trading Leaderboard**\n"]
+    for i, (name, bal) in enumerate(leaders, 1): lines.append(f"{i}. @{name or 'Anon'} - **${bal:.2f}**")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def orderbook_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_user_premium(update.effective_user.id): return await update.message.reply_text("🔒 Premium required.")
+    if not context.args: return await update.message.reply_text("⚠️ Usage:\n`/ob BTC/USDT`", parse_mode="Markdown")
+    msg = await update.message.reply_text(f"📖 Fetching order book for `{context.args[0].upper()}`...")
+    await msg.edit_text(await get_orderbook_text(context.args[0].upper()), parse_mode="Markdown")
+
+async def filters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    log_action(uid, "/filters")
+    if not is_user_premium(uid): return await update.message.reply_text("🔒 Premium required.")
+    s = get_user_settings(uid)
+    text = f"""⚙️ **Your Settings**
+
+• Trade Size   : `${s['trade_size_usd']:.0f}`
+• Min Profit   : `${s['min_net_profit_usd']:.1f}`
+• Min Spread   : `{s['min_spread_pct']:.1f}%`
+• Max Spread   : `{s['max_spread_pct']:.1f}%`
+• Loose Mode   : `{'ON 🔓' if s['loose_mode'] else 'OFF 🔒'}`
+• Alerts Status: `{'Paused' if s['paused'] else 'Active'}`
+• Watchlist    : `{len(s['watchlist'])} coins`
+• Paper Balance: `${s['paper_balance']:.2f}`
+
+📋 **Commands:** `/settradesize 100`, `/setminprofit 5`, `/setminspread 0.8`, `/loosemode`, `/pause`, `/watchlist`"""
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def set_value(update, context, field, type_func, name):
+    uid = update.effective_user.id
+    if not context.args: return await update.message.reply_text(f"⚠️ Example: `/{update.message.text.split()[0][1:]} 5`")
+    update_user_setting(uid, field, type_func(context.args[0]))
+    await update.message.reply_text(f"✅ {name} set to **{context.args[0]}**")
+
+async def setminprofit_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await set_value(update, context, 'min_net_profit_usd', float, "Min net profit")
+async def setminspread_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await set_value(update, context, 'min_spread_pct', float, "Min spread")
+async def setmaxspread_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await set_value(update, context, 'max_spread_pct', float, "Max spread")
+async def setmaxresults_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await set_value(update, context, 'max_results', int, "Max results")
+async def settradesize_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await set_value(update, context, 'trade_size_usd', float, "Trade size")
+
+async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    update_user_setting(update.effective_user.id, 'paused', 1)
+    await update.message.reply_text("⏸ Background alerts **paused**.")
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    update_user_setting(update.effective_user.id, 'paused', 0)
+    await update.message.reply_text("▶️ Background alerts **resumed**.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = """🤖 **Full Command List**
+
+`/scan` - Find arbitrage opportunities
+`/loosemode` - Toggle strict contract verification
+`/portfolio` - View paper trading stats
+`/leaderboard` - View top paper traders
+`/filters` - View your settings
+`/pause` / `/resume` - Background alerts
+`/watch BTC/USDT` / `/unwatch BTC/USDT`"""
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ==========================================
+# 5. HANDLERS (Admin - Complete Set)
+# ==========================================
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Unauthorized")
+    users = get_all_users_detailed()
+    lines = [f"**Users: {len(users)}**\n"]
+    for u in users[:30]:
+        status = "🚫" if u[3] else ("✅" if u[2] else "❌")
+        lines.append(f"`{u[0]}` @{u[1] or '—'} {status} | {u[9] or 'never'}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ `/userinfo secret user_id`")
+    try: target = int(context.args[1])
+    except ValueError: return await update.message.reply_text("Invalid ID")
+    info = get_user_full_info(target)
+    if not info: return await update.message.reply_text("User not found")
+    actions = "\n".join([f"`{a[1]}` → {a[0]}" for a in get_user_actions(target, 12)]) or "None"
+    text = f"""👤 `{info['user_id']}` @{info['username'] or '—'}
+Status: {'🚫 Banned' if info['is_banned'] else ('Premium' if info['is_premium'] else 'Normal')}
+Loose Mode: {'ON' if info['loose_mode'] else 'OFF'} | Paper Balance: ${info['paper_balance']:.2f}
+Last active: `{info['last_active']}`
+
+📜 Last actions:
+{actions}"""
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ `/ban secret user_id`")
+    conn = sqlite3.connect("arbitrage_users.db")
+    conn.execute("UPDATE users SET is_banned = 1, is_premium = 0 WHERE user_id = ?", (int(context.args[1]),)).connection.commit()
+    conn.close()
+    await update.message.reply_text(f"🚫 User `{context.args[1]}` banned.")
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ `/unban secret user_id`")
+    conn = sqlite3.connect("arbitrage_users.db")
+    conn.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (int(context.args[1]),)).connection.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ User `{context.args[1]}` unbanned.")
+
+async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ `/revoke secret user_id`")
+    uid = int(context.args[1])
+    conn = sqlite3.connect("arbitrage_users.db")
+    conn.execute("UPDATE users SET is_premium = 0, is_banned = 0 WHERE user_id = ?", (uid,))
+    conn.execute("UPDATE access_keys SET is_used = 0, used_by = NULL WHERE used_by = ?", (uid,)).connection.commit()
+    conn.close()
+    await update.message.reply_text(f"🔒 Access of `{uid}` revoked.")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Unauthorized")
+    users = get_all_users_detailed()
+    prem = sum(1 for u in users if u[2] and not u[3])
+    banned = sum(1 for u in users if u[3])
+    await update.message.reply_text(f"📊 Total: {len(users)} | Premium: {prem} | Banned: {banned} | Pairs: {len(UNIVERSAL_SYMBOLS)}")
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Unauthorized")
+    msg = " ".join(context.args[1:])
+    ok = fail = 0
+    for uid in get_all_premium_users():
+        try:
+            await context.bot.send_message(uid, f"📢 **Admin Message**\n\n{msg}", parse_mode="Markdown")
+            ok += 1
+            await asyncio.sleep(0.04)
+        except: fail += 1
+    await update.message.reply_text(f"✅ Sent: {ok} | Failed: {fail}")
+
+async def sendto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 3 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ `/sendto secret user_id message`")
+    try:
+        await context.bot.send_message(int(context.args[1]), f"🔒 **Admin Message**\n\n{' '.join(context.args[2:])}", parse_mode="Markdown")
+        await update.message.reply_text("✅ Sent")
+    except Exception as e: await update.message.reply_text(f"❌ {e}")
+
+async def generate_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Unauthorized")
+    key = context.args[1]
+    conn = sqlite3.connect("arbitrage_users.db")
+    conn.execute("INSERT OR IGNORE INTO access_keys (key_code) VALUES (?)", (key,)).connection.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ New key created:\n`{key}`", parse_mode="Markdown")
+
+async def givepremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Usage: `/givepremium secret user_id`")
+    try:
+        target_uid = int(context.args[1])
+        conn = sqlite3.connect("arbitrage_users.db")
+        conn.execute("INSERT OR IGNORE INTO users (user_id, is_premium, registered_at) VALUES (?, 1, ?)", (target_uid, now_ist()))
+        conn.execute("UPDATE users SET is_premium = 1, is_banned = 0 WHERE user_id = ?", (target_uid,)).connection.commit()
+        conn.close()
+        await update.message.reply_text(f"✅ Successfully granted premium access to user `{target_uid}`.", parse_mode="Markdown")
+        await context.bot.send_message(target_uid, "🎉 **An Admin has granted you Premium Access!**\nType /start to begin.", parse_mode="Markdown")
+    except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
+
+async def deluser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Usage: `/deluser secret user_id`")
+    try:
+        target_uid = int(context.args[1])
+        conn = sqlite3.connect("arbitrage_users.db")
+        conn.execute("DELETE FROM users WHERE user_id = ?", (target_uid,))
+        conn.execute("DELETE FROM watchlist WHERE user_id = ?", (target_uid,))
+        conn.execute("DELETE FROM user_actions WHERE user_id = ?", (target_uid,)).connection.commit()
+        conn.close()
+        await update.message.reply_text(f"🗑️ User `{target_uid}` completely wiped.", parse_mode="Markdown")
+    except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Usage: `/backup secret`")
+    try:
+        await update.message.reply_document(document=open("arbitrage_users.db", "rb"), filename=f"arbitrage_backup_{int(time.time())}.db")
+    except Exception as e: await update.message.reply_text(f"❌ Failed: {e}")
+
+
+# ==========================================
+# 6. CLOUD PORT FIX / HEALTH SERVER
+# ==========================================
+async def cloud_health_handler(reader, writer):
+    request = (await reader.read(1024)).decode('utf8')
+    response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nBot is running healthy!\n"
+    writer.write(response.encode('utf8'))
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+async def start_cloud_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = await asyncio.start_server(cloud_health_handler, '0.0.0.0', port)
+    print(f"✅ Cloud Health-Check Server listening on port {port}")
+    return server
+
+
+# ==========================================
+# 7. ROUTER & DAEMON
+# ==========================================
+async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = update.effective_user.id
+    data = query.data
+
+    if data == "run_manual_scan":
+        await query.answer()
+        await scan_command(update, context)
+    elif data == "show_filters":
+        await query.answer()
+        class FakeUpdate:
+            def __init__(self, original):
+                self.message = original.callback_query.message
+                self.effective_user = original.effective_user
+        await filters_command(FakeUpdate(update), context)
+    elif data.startswith("ob:"):
+        await query.answer()
+        symbol = data[3:]
+        await query.message.reply_text(f"📖 Loading `{symbol}`...")
+        await query.message.reply_text(await get_orderbook_text(symbol), parse_mode="Markdown")
+    elif data.startswith("pt:"):
+        prof = float(data.split(":")[1])
+        add_paper_profit(uid, prof)
+        
+        kb = query.message.reply_markup.inline_keyboard
+        new_kb = []
+        for row in kb:
+            new_row = []
+            for btn in row:
+                if btn.callback_data == data:
+                    new_row.append(InlineKeyboardButton(f"✅ Executed (+${prof:.2f})", callback_data="ignore"))
+                else:
+                    new_row.append(btn)
+            new_kb.append(new_row)
+            
+        await query.message.edit_reply_markup(InlineKeyboardMarkup(new_kb))
+        await query.answer(f"✅ Successfully paper traded! Earned ${prof:.2f}", show_alert=True)
+    elif data == "ignore":
+        await query.answer("You already traded this opportunity!", show_alert=False)
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Error caught in telegram dispatcher: {context.error}")
+
+async def background_arbitrage_daemon(app):
+    await asyncio.sleep(4)
+    await load_universal_symbols()
+    last_refresh = time.time()
+
+    while True:
+        try:
+            if time.time() - last_refresh > CURRENCY_REFRESH_SECONDS:
+                await load_universal_symbols()
+                last_refresh = time.time()
+
+            users = get_all_premium_users()
+            if users and UNIVERSAL_SYMBOLS:
+                prices_map = await fetch_all_prices()
+                for uid in users:
+                    settings = get_user_settings(uid)
+                    if not settings or settings['paused'] or settings['is_banned']: continue
+                    alerts = []
+                    for sym, prices in prices_map.items():
+                        if settings['watchlist'] and sym not in settings['watchlist']: continue
+                        arb = calculate_net_arbitrage(sym, prices, settings['trade_size_usd'], settings['loose_mode'])
+                        if (arb and arb['net_profit'] >= settings['min_net_profit_usd'] and
+                            arb['net_spread_pct'] >= settings['min_spread_pct'] and arb['net_spread_pct'] <= settings['max_spread_pct']):
+                            alerts.append(arb)
+                            
+                    alerts.sort(key=lambda x: x['net_profit'], reverse=True)
+                    for arb in alerts[:5]:
+                        kb = [[InlineKeyboardButton("📖 View Order Book", callback_data=f"ob:{arb['symbol']}")],
+                              [InlineKeyboardButton("🎮 Paper Trade This!", callback_data=f"pt:{arb['net_profit']:.2f}")]]
+                        try:
+                            await app.bot.send_message(uid, format_detailed_alert(arb), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+                            await asyncio.sleep(1.2)
+                        except: pass
+            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        except Exception as e:
+            print(f"Daemon: {e}")
+            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+async def post_init(app):
+    commands = [
+        BotCommand("start", "Start the bot"), BotCommand("scan", "Find arbitrage opportunities"),
+        BotCommand("loosemode", "Toggle strict contract checks"), BotCommand("portfolio", "View paper trading stats"),
+        BotCommand("leaderboard", "View top traders"), BotCommand("ob", "View order book of a coin"),
+        BotCommand("filters", "View & change your settings"), BotCommand("pause", "Pause alerts"),
+        BotCommand("resume", "Resume alerts"), BotCommand("help", "Show all commands"),
+    ]
+    await app.bot.set_my_commands(commands)
+    print("✅ Command menu registered")
+    
+    asyncio.create_task(background_arbitrage_daemon(app))
+    asyncio.create_task(start_cloud_health_server())
+
+async def post_shutdown(app):
+    for o in ccxt_instances.values():
+        try: await o.close()
+        except: pass
+
+def main():
+    init_db()
+    app = (ApplicationBuilder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout(30).post_init(post_init).post_shutdown(post_shutdown).build())
+
+    handlers = [
+        ("start", start_command), ("register", register_command), ("help", help_command),
+        ("scan", scan_command), ("ob", orderbook_command), ("loosemode", loosemode_command), 
+        ("portfolio", portfolio_command), ("leaderboard", leaderboard_command), ("filters", filters_command), 
+        ("setminprofit", setminprofit_command), ("setminspread", setminspread_command),
+        ("setmaxspread", setmaxspread_command), ("setmaxresults", setmaxresults_command),
+        ("settradesize", settradesize_command), ("pause", pause_command), ("resume", resume_command),
+        
+        ("users", users_command), ("userinfo", userinfo_command), ("ban", ban_command),
+        ("unban", unban_command), ("revoke", revoke_command), ("stats", stats_command),
+        ("broadcast", broadcast_command), ("sendto", sendto_command), ("generatekey", generate_key_command),
+        ("givepremium", givepremium_command), ("deluser", deluser_command), ("backup", backup_command)
+    ]
+    for cmd, func in handlers: app.add_handler(CommandHandler(cmd, func))
+
+    app.add_handler(CallbackQueryHandler(button_router))
+    app.add_error_handler(error_handler)
+
+    print("Bot started (Loose Mode, Paper Trading & Admin controls fully active)...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
+

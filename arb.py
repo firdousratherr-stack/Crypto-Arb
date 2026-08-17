@@ -15,7 +15,6 @@ from telegram.ext import (
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-# We use os.environ.get to safely load tokens from Render, with your token as a fallback.
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8848406877:AAHuBsI_IXmFTvVg8EKu-r7XZm9Gy9uYTfA")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "X")
 
@@ -25,7 +24,7 @@ DEFAULT_MIN_PROFIT_USER = 5.0
 DEFAULT_MIN_SPREAD_PCT = 0.5
 DEFAULT_MAX_SPREAD_PCT = 50.0
 DEFAULT_MAX_RESULTS = 15
-SCAN_CONCURRENCY = 8
+SCAN_CONCURRENCY = 12
 
 MIN_24H_VOLUME_USD = 40000
 GENERIC_WITHDRAW_FEE_COIN_UNITS = 1.0
@@ -302,10 +301,9 @@ ccxt_instances = {
     'bitfinex': ccxt_async.bitfinex({'enableRateLimit': True, 'timeout': 25000}),
 }
 
-
 async def load_universal_symbols():
     global UNIVERSAL_SYMBOLS, SYMBOL_EXCHANGE_MAP, CURRENCY_STATUS, CONTRACT_ADDRESSES
-    print("Loading markets...")
+    print("Loading markets across all exchanges...")
     exchange_markets = {}
     
     for name, obj in ccxt_instances.items():
@@ -318,35 +316,38 @@ async def load_universal_symbols():
                 currencies = await obj.fetch_currencies()
                 status = {}
                 contracts = {}
-                for code, cur in currencies.items():
-                    code_up = code.upper()
-                    deposit = cur.get('deposit', cur.get('active'))
-                    withdraw = cur.get('withdraw', cur.get('active'))
-                    info = cur.get('info') or {}
-                    if isinstance(info, dict):
-                        for k in ['depositEnable', 'deposit_enable', 'deposit']:
-                            if k in info: deposit = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
-                        for k in ['withdrawEnable', 'withdraw_enable', 'withdraw']:
-                            if k in info: withdraw = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
-                    status[code_up] = {'deposit': deposit, 'withdraw': withdraw}
+                if isinstance(currencies, dict):
+                    for code, cur in currencies.items():
+                        if not isinstance(cur, dict):
+                            continue
+                        code_up = code.upper()
+                        deposit = cur.get('deposit', cur.get('active'))
+                        withdraw = cur.get('withdraw', cur.get('active'))
+                        info = cur.get('info') or {}
+                        if isinstance(info, dict):
+                            for k in ['depositEnable', 'deposit_enable', 'deposit']:
+                                if k in info: deposit = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
+                            for k in ['withdrawEnable', 'withdraw_enable', 'withdraw']:
+                                if k in info: withdraw = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
+                        status[code_up] = {'deposit': deposit, 'withdraw': withdraw}
 
-                    contract = None
-                    networks = cur.get('networks') or {}
-                    if isinstance(networks, dict):
-                        for net in networks.values():
-                            if isinstance(net, dict):
-                                addr = net.get('contractAddress') or net.get('address')
-                                if addr:
-                                    contract = str(addr).lower()
-                                    break
-                    if contract:
-                        contracts[code_up] = contract
+                        contract = None
+                        networks = cur.get('networks') or {}
+                        if isinstance(networks, dict):
+                            for net in networks.values():
+                                if isinstance(net, dict):
+                                    addr = net.get('contractAddress') or net.get('address')
+                                    if addr:
+                                        contract = str(addr).lower()
+                                        break
+                        if contract:
+                            contracts[code_up] = contract
                 CURRENCY_STATUS[name] = status
                 CONTRACT_ADDRESSES[name] = contracts
-            except Exception as e:
+            except Exception:
                 CURRENCY_STATUS[name] = {}
                 CONTRACT_ADDRESSES[name] = {}
-        except Exception as e:
+        except Exception:
             exchange_markets[name] = set()
 
     symbol_to_exchanges = {}
@@ -355,6 +356,7 @@ async def load_universal_symbols():
             symbol_to_exchanges.setdefault(s, set()).add(name)
     SYMBOL_EXCHANGE_MAP = {s: exs for s, exs in symbol_to_exchanges.items() if len(exs) >= 2}
     UNIVERSAL_SYMBOLS = sorted(SYMBOL_EXCHANGE_MAP.keys())
+    print(f"Universal pairs loaded: {len(UNIVERSAL_SYMBOLS)}")
 
 async def fetch_ccxt_ticker(exchange_name, exchange_obj, symbol):
     try:
@@ -362,7 +364,8 @@ async def fetch_ccxt_ticker(exchange_name, exchange_obj, symbol):
         if ticker and ticker.get('last'):
             volume = float(ticker.get('quoteVolume') or (float(ticker.get('baseVolume', 0)) * float(ticker['last'])))
             return exchange_name, float(ticker['last']), volume
-    except: pass
+    except Exception:
+        pass
     return exchange_name, None, 0.0
 
 async def scan_symbol_prices(symbol: str):
@@ -454,7 +457,8 @@ async def get_orderbook_text(symbol: str) -> str:
             lines.append("Sell (Asks):")
             for p, v in ob.get('asks', [])[:5]: lines.append(f"`{p:.5f}` × {v:.4f}")
             lines.append("")
-        except: continue
+        except Exception:
+            continue
     if len(lines) <= 1: return f"Could not fetch order book for `{symbol}`"
     return "\n".join(lines)
 
@@ -498,11 +502,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_user_premium(uid):
         kb = [[InlineKeyboardButton("⚡ Run Scan", callback_data="run_manual_scan"), InlineKeyboardButton("⚙️ Filters", callback_data="show_filters")]]
         
-        # Using a triple-quote multi-line string to prevent syntax errors
+        exchange_names = " • ".join([k.capitalize() for k in ccxt_instances.keys()])
+        
         text = f"""👑 **Arbitrage Terminal Active**
 
 Tracked pairs: `{len(UNIVERSAL_SYMBOLS)}`
-Exchanges: Gate • LBank • Bitrue • XT
+Exchanges ({len(ccxt_instances)}):
+{exchange_names}
 
 📌 **Quick Commands:**
 `/scan` - Find opportunities
@@ -534,7 +540,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = get_user_settings(uid)
     if not settings: return await message.reply_text("Settings not found.")
 
-    status = await message.reply_text("🔍 Scanning markets...")
+    status = await message.reply_text("🔍 Scanning markets across 17 exchanges...")
     results = await scan_all_symbols(
         min_profit=settings['min_net_profit_usd'], min_spread=settings['min_spread_pct'],
         max_spread=settings['max_spread_pct'], symbols=list(settings['watchlist']) if settings['watchlist'] else None,
@@ -553,7 +559,8 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
             await asyncio.sleep(0.35)
-        except: pass
+        except Exception:
+            pass
 
 async def loosemode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -618,6 +625,35 @@ async def setmaxspread_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def setmaxresults_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await set_value(update, context, 'max_results', int, "Max results")
 async def settradesize_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await set_value(update, context, 'trade_size_usd', float, "Trade size")
 
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_user_premium(uid): return await update.message.reply_text("🔒 Premium required.")
+    if not context.args: return await update.message.reply_text("⚠️ Usage:\n`/watch BTC/USDT`", parse_mode="Markdown")
+    symbol = context.args[0].upper()
+    conn = sqlite3.connect("arbitrage_users.db")
+    try:
+        conn.execute("INSERT INTO watchlist (user_id, symbol) VALUES (?, ?)", (uid, symbol))
+        conn.commit()
+        await update.message.reply_text(f"✅ Added `{symbol}` to your watchlist.", parse_mode="Markdown")
+    except sqlite3.IntegrityError:
+        await update.message.reply_text(f"⚠️ `{symbol}` is already in your watchlist.", parse_mode="Markdown")
+    finally:
+        conn.close()
+
+async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_user_premium(uid): return await update.message.reply_text("🔒 Premium required.")
+    if not context.args: return await update.message.reply_text("⚠️ Usage:\n`/unwatch BTC/USDT`", parse_mode="Markdown")
+    symbol = context.args[0].upper()
+    conn = sqlite3.connect("arbitrage_users.db")
+    conn.execute("DELETE FROM watchlist WHERE user_id = ? AND symbol = ?", (uid, symbol))
+    if conn.total_changes > 0:
+        await update.message.reply_text(f"🗑️ Removed `{symbol}` from your watchlist.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"⚠️ `{symbol}` was not in your watchlist.", parse_mode="Markdown")
+    conn.commit()
+    conn.close()
+
 async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user_setting(update.effective_user.id, 'paused', 1)
     await update.message.reply_text("⏸ Background alerts **paused**.")
@@ -629,13 +665,28 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = """🤖 **Full Command List**
 
+🔍 **Core Commands**
 `/scan` - Find arbitrage opportunities
 `/loosemode` - Toggle strict contract verification
+`/ob BTC/USDT` - View order book for a coin
+
+🎮 **Paper Trading**
 `/portfolio` - View paper trading stats
 `/leaderboard` - View top paper traders
-`/filters` - View your settings
-`/pause` / `/resume` - Background alerts
-`/watch BTC/USDT` / `/unwatch BTC/USDT`"""
+
+⚙️ **Filters & Settings**
+`/filters` - View your active settings
+`/settradesize 100` - Set trade size in USD
+`/setminprofit 5` - Set min profit in USD
+`/setminspread 0.8` - Set min spread percentage
+`/setmaxspread 50` - Set max spread percentage
+`/setmaxresults 15` - Set max results to show
+
+🔔 **Watchlist & Alerts**
+`/watch BTC/USDT` - Add coin to watchlist (filters scan to watchlist only)
+`/unwatch BTC/USDT` - Remove coin from watchlist
+`/pause` - Pause background alerts
+`/resume` - Resume background alerts"""
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -706,7 +757,8 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(uid, f"📢 **Admin Message**\n\n{msg}", parse_mode="Markdown")
             ok += 1
             await asyncio.sleep(0.04)
-        except: fail += 1
+        except Exception:
+            fail += 1
     await update.message.reply_text(f"✅ Sent: {ok} | Failed: {fail}")
 
 async def sendto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -759,7 +811,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 6. CLOUD PORT FIX / HEALTH SERVER
 # ==========================================
 async def cloud_health_handler(reader, writer):
-    request = (await reader.read(1024)).decode('utf8')
+    await reader.read(1024)
     response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nBot is running healthy!\n"
     writer.write(response.encode('utf8'))
     await writer.drain()
@@ -851,10 +903,11 @@ async def background_arbitrage_daemon(app):
                         try:
                             await app.bot.send_message(uid, format_detailed_alert(arb), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
                             await asyncio.sleep(1.2)
-                        except: pass
+                        except Exception:
+                            pass
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
         except Exception as e:
-            print(f"Daemon: {e}")
+            print(f"Daemon error: {e}")
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 async def post_init(app):
@@ -874,7 +927,7 @@ async def post_init(app):
 async def post_shutdown(app):
     for o in ccxt_instances.values():
         try: await o.close()
-        except: pass
+        except Exception: pass
 
 def main():
     init_db()
@@ -887,6 +940,7 @@ def main():
         ("setminprofit", setminprofit_command), ("setminspread", setminspread_command),
         ("setmaxspread", setmaxspread_command), ("setmaxresults", setmaxresults_command),
         ("settradesize", settradesize_command), ("pause", pause_command), ("resume", resume_command),
+        ("watch", watch_command), ("unwatch", unwatch_command),
         
         ("users", users_command), ("userinfo", userinfo_command), ("ban", ban_command),
         ("unban", unban_command), ("revoke", revoke_command), ("stats", stats_command),
@@ -898,9 +952,8 @@ def main():
     app.add_handler(CallbackQueryHandler(button_router))
     app.add_error_handler(error_handler)
 
-    print("Bot started (Loose Mode, Paper Trading & Admin controls fully active)...")
+    print("Bot started (All 17 exchanges, Loose Mode, Paper Trading & Admin controls active)...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-

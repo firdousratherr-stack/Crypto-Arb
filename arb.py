@@ -19,6 +19,7 @@ from telegram.ext import (
 # ==========================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8848406877:AAHuBsI_IXmFTvVg8EKu-r7XZm9Gy9uYTfA")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "X")
+ADMIN_USER_ID = 1140410671  # Hardcoded Premium Admin ID
 
 SCAN_INTERVAL_SECONDS = 30
 DEFAULT_TRADE_SIZE_USD = 100.0
@@ -172,8 +173,7 @@ def get_user_settings(user_id: int):
     """, (user_id,))
     row = c.fetchone()
     
-    # If the database was wiped but you are the hardcoded admin, create default settings on the fly
-    if not row and user_id == 1140410671:
+    if not row and user_id == ADMIN_USER_ID:
         c.execute("INSERT OR IGNORE INTO users (user_id, username, is_premium, registered_at) VALUES (?, ?, 1, ?)", (user_id, "Admin", now_ist()))
         conn.commit()
         trade_size, min_profit, min_spread, max_spread, max_results, paused, is_banned, loose_mode, paper_balance = (100.0, 5.0, 0.5, 50.0, 15, 0, 0, 0, 0.0)
@@ -233,10 +233,8 @@ def get_paper_leaderboard():
     return rows
 
 def is_user_premium(user_id: int) -> bool:
-    # --- PERMANENT ADMIN BYPASS ---
-    if user_id == 1140410671:
+    if user_id == ADMIN_USER_ID:
         return True
-    # ------------------------------
     
     conn = sqlite3.connect("arbitrage_users.db")
     c = conn.cursor()
@@ -270,11 +268,9 @@ def get_all_premium_users():
     rows = c.fetchall()
     conn.close()
     
-    # Always include the hardcoded admin id in the broadcast list
-    admin_id = 1140410671
     user_ids = [r[0] for r in rows]
-    if admin_id not in user_ids:
-        user_ids.append(admin_id)
+    if ADMIN_USER_ID not in user_ids:
+        user_ids.append(ADMIN_USER_ID)
         
     return user_ids
 
@@ -305,91 +301,106 @@ def get_user_full_info(user_id: int):
     }
 
 # ==========================================
-# 3. MARKET ENGINE (Dynamic Loader)
+# 3. MARKET ENGINE (Fast Parallel Loader)
 # ==========================================
 _exchanges_to_init = {
-    'gate': {'enableRateLimit': True, 'timeout': 25000, 'options': {'defaultType': 'spot'}},
-    'lbank': {'enableRateLimit': True, 'timeout': 25000},
-    'bitrue': {'enableRateLimit': True, 'timeout': 25000},
-    'xt': {'enableRateLimit': True, 'timeout': 25000},
-    'ascendex': {'enableRateLimit': True, 'timeout': 25000},
-    'poloniex': {'enableRateLimit': True, 'timeout': 25000},
-    'bingx': {'enableRateLimit': True, 'timeout': 25000},
-    'digifinex': {'enableRateLimit': True, 'timeout': 25000},
-    'binance': {'enableRateLimit': True, 'timeout': 25000},
-    'bybit': {'enableRateLimit': True, 'timeout': 25000},
-    'okx': {'enableRateLimit': True, 'timeout': 25000},
-    'kucoin': {'enableRateLimit': True, 'timeout': 25000},
-    'mexc': {'enableRateLimit': True, 'timeout': 25000},
-    'bitget': {'enableRateLimit': True, 'timeout': 25000},
-    'htx': {'enableRateLimit': True, 'timeout': 25000},
-    'kraken': {'enableRateLimit': True, 'timeout': 25000},
-    'bitfinex': {'enableRateLimit': True, 'timeout': 25000},
+    'gate': {'enableRateLimit': True, 'timeout': 20000, 'options': {'defaultType': 'spot'}},
+    'lbank': {'enableRateLimit': True, 'timeout': 20000},
+    'bitrue': {'enableRateLimit': True, 'timeout': 20000},
+    'xt': {'enableRateLimit': True, 'timeout': 20000},
+    'ascendex': {'enableRateLimit': True, 'timeout': 20000},
+    'poloniex': {'enableRateLimit': True, 'timeout': 20000},
+    'bingx': {'enableRateLimit': True, 'timeout': 20000},
+    'digifinex': {'enableRateLimit': True, 'timeout': 20000},
+    'binance': {'enableRateLimit': True, 'timeout': 20000},
+    'bybit': {'enableRateLimit': True, 'timeout': 20000},
+    'okx': {'enableRateLimit': True, 'timeout': 20000},
+    'kucoin': {'enableRateLimit': True, 'timeout': 20000},
+    'mexc': {'enableRateLimit': True, 'timeout': 20000},
+    'bitget': {'enableRateLimit': True, 'timeout': 20000},
+    'htx': {'enableRateLimit': True, 'timeout': 20000},
+    'kraken': {'enableRateLimit': True, 'timeout': 20000},
+    'bitfinex': {'enableRateLimit': True, 'timeout': 20000},
 }
 
 ccxt_instances = {}
 for ex_id, config in _exchanges_to_init.items():
     if hasattr(ccxt_async, ex_id):
         ccxt_instances[ex_id] = getattr(ccxt_async, ex_id)(config)
-    else:
-        print(f"⚠️ Warning: Exchange '{ex_id}' not found in installed CCXT version. Skipping.")
+
+async def _load_single_exchange(name, obj):
+    spot_symbols = set()
+    status = {}
+    contracts = {}
+    
+    try:
+        markets = await asyncio.wait_for(obj.load_markets(), timeout=18.0)
+        for s, m in markets.items():
+            if not isinstance(m, dict):
+                continue
+            is_spot = m.get('spot') is True or m.get('type') == 'spot' or ('/USDT' in s and not m.get('swap', False) and not m.get('future', False))
+            is_usdt = m.get('quote') == 'USDT' or s.endswith('/USDT')
+            is_active = m.get('active') is not False
+            if is_spot and is_usdt and is_active:
+                spot_symbols.add(s)
+    except Exception:
+        pass
+
+    try:
+        currencies = await asyncio.wait_for(obj.fetch_currencies(), timeout=8.0)
+        if isinstance(currencies, dict):
+            for code, cur in currencies.items():
+                if not isinstance(cur, dict): continue
+                code_up = code.upper()
+                deposit = cur.get('deposit', cur.get('active'))
+                withdraw = cur.get('withdraw', cur.get('active'))
+                info = cur.get('info') or {}
+                if isinstance(info, dict):
+                    for k in ['depositEnable', 'deposit_enable', 'deposit']:
+                        if k in info: deposit = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
+                    for k in ['withdrawEnable', 'withdraw_enable', 'withdraw']:
+                        if k in info: withdraw = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
+                status[code_up] = {'deposit': deposit, 'withdraw': withdraw}
+
+                contract = None
+                networks = cur.get('networks') or {}
+                if isinstance(networks, dict):
+                    for net in networks.values():
+                        if isinstance(net, dict):
+                            addr = net.get('contractAddress') or net.get('address')
+                            if addr:
+                                contract = str(addr).lower()
+                                break
+                if contract:
+                    contracts[code_up] = contract
+    except Exception:
+        pass
+
+    return name, spot_symbols, status, contracts
 
 async def load_universal_symbols():
     global UNIVERSAL_SYMBOLS, SYMBOL_EXCHANGE_MAP, CURRENCY_STATUS, CONTRACT_ADDRESSES
-    print("Loading markets across all active exchanges...")
-    exchange_markets = {}
+    print("Loading markets concurrently across all active exchanges...")
     
-    for name, obj in ccxt_instances.items():
-        try:
-            markets = await obj.load_markets()
-            spot_symbols = {s for s, m in markets.items() if m.get('spot') and m.get('quote') == 'USDT' and m.get('active') is not False}
-            exchange_markets[name] = spot_symbols
-            
-            try:
-                currencies = await obj.fetch_currencies()
-                status = {}
-                contracts = {}
-                if isinstance(currencies, dict):
-                    for code, cur in currencies.items():
-                        if not isinstance(cur, dict):
-                            continue
-                        code_up = code.upper()
-                        deposit = cur.get('deposit', cur.get('active'))
-                        withdraw = cur.get('withdraw', cur.get('active'))
-                        info = cur.get('info') or {}
-                        if isinstance(info, dict):
-                            for k in ['depositEnable', 'deposit_enable', 'deposit']:
-                                if k in info: deposit = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
-                            for k in ['withdrawEnable', 'withdraw_enable', 'withdraw']:
-                                if k in info: withdraw = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
-                        status[code_up] = {'deposit': deposit, 'withdraw': withdraw}
+    tasks = [_load_single_exchange(name, obj) for name, obj in ccxt_instances.items()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                        contract = None
-                        networks = cur.get('networks') or {}
-                        if isinstance(networks, dict):
-                            for net in networks.values():
-                                if isinstance(net, dict):
-                                    addr = net.get('contractAddress') or net.get('address')
-                                    if addr:
-                                        contract = str(addr).lower()
-                                        break
-                        if contract:
-                            contracts[code_up] = contract
-                CURRENCY_STATUS[name] = status
-                CONTRACT_ADDRESSES[name] = contracts
-            except Exception:
-                CURRENCY_STATUS[name] = {}
-                CONTRACT_ADDRESSES[name] = {}
-        except Exception:
-            exchange_markets[name] = set()
+    exchange_markets = {}
+    for res in results:
+        if isinstance(res, tuple):
+            name, spot_symbols, status, contracts = res
+            exchange_markets[name] = spot_symbols
+            CURRENCY_STATUS[name] = status
+            CONTRACT_ADDRESSES[name] = contracts
 
     symbol_to_exchanges = {}
     for name, syms in exchange_markets.items():
         for s in syms:
             symbol_to_exchanges.setdefault(s, set()).add(name)
+            
     SYMBOL_EXCHANGE_MAP = {s: exs for s, exs in symbol_to_exchanges.items() if len(exs) >= 2}
     UNIVERSAL_SYMBOLS = sorted(SYMBOL_EXCHANGE_MAP.keys())
-    print(f"Universal pairs loaded: {len(UNIVERSAL_SYMBOLS)}")
+    print(f"✅ Loaded {len(UNIVERSAL_SYMBOLS)} universal pairs across active exchanges.")
 
 async def fetch_ccxt_ticker(exchange_name, exchange_obj, symbol):
     try:
@@ -907,8 +918,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"Error caught in telegram dispatcher: {context.error}")
 
 async def background_arbitrage_daemon(app):
-    await asyncio.sleep(4)
-    await load_universal_symbols()
     last_refresh = time.time()
 
     while True:
@@ -955,6 +964,10 @@ async def post_init(app):
     ]
     await app.bot.set_my_commands(commands)
     print("✅ Command menu registered")
+    
+    # Load markets in parallel immediately before starting the bot loop
+    await load_universal_symbols()
+    
     asyncio.create_task(background_arbitrage_daemon(app))
 
 async def post_shutdown(app):
@@ -965,7 +978,6 @@ async def post_shutdown(app):
 def main():
     init_db()
     
-    # Start the robust threaded web server for Render health checks
     threading.Thread(target=run_health_server, daemon=True).start()
     
     app = (ApplicationBuilder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout(30).post_init(post_init).post_shutdown(post_shutdown).build())
@@ -989,7 +1001,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_router))
     app.add_error_handler(error_handler)
 
-    print("Bot started (All exchanges loading dynamically, Loose Mode, Paper Trading & Admin controls active)...")
+    print("Bot started (Optimized Concurrent Engine Active)...")
     app.run_polling()
 
 if __name__ == "__main__":

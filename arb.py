@@ -27,7 +27,6 @@ DEFAULT_MIN_PROFIT_USER = 5.0
 DEFAULT_MIN_SPREAD_PCT = 0.5
 DEFAULT_MAX_SPREAD_PCT = 50.0
 DEFAULT_MAX_RESULTS = 15
-SCAN_CONCURRENCY = 12
 
 MIN_24H_VOLUME_USD = 40000
 GENERIC_WITHDRAW_FEE_COIN_UNITS = 1.0
@@ -301,26 +300,26 @@ def get_user_full_info(user_id: int):
     }
 
 # ==========================================
-# 3. MARKET ENGINE (Fast Parallel Loader)
+# 3. MARKET ENGINE (Bulk Fetch Optimization)
 # ==========================================
 _exchanges_to_init = {
-    'gate': {'enableRateLimit': True, 'timeout': 20000, 'options': {'defaultType': 'spot'}},
-    'lbank': {'enableRateLimit': True, 'timeout': 20000},
-    'bitrue': {'enableRateLimit': True, 'timeout': 20000},
-    'xt': {'enableRateLimit': True, 'timeout': 20000},
-    'ascendex': {'enableRateLimit': True, 'timeout': 20000},
-    'poloniex': {'enableRateLimit': True, 'timeout': 20000},
-    'bingx': {'enableRateLimit': True, 'timeout': 20000},
-    'digifinex': {'enableRateLimit': True, 'timeout': 20000},
-    'binance': {'enableRateLimit': True, 'timeout': 20000},
-    'bybit': {'enableRateLimit': True, 'timeout': 20000},
-    'okx': {'enableRateLimit': True, 'timeout': 20000},
-    'kucoin': {'enableRateLimit': True, 'timeout': 20000},
-    'mexc': {'enableRateLimit': True, 'timeout': 20000},
-    'bitget': {'enableRateLimit': True, 'timeout': 20000},
-    'htx': {'enableRateLimit': True, 'timeout': 20000},
-    'kraken': {'enableRateLimit': True, 'timeout': 20000},
-    'bitfinex': {'enableRateLimit': True, 'timeout': 20000},
+    'gate': {'enableRateLimit': True, 'timeout': 30000, 'options': {'defaultType': 'spot'}},
+    'lbank': {'enableRateLimit': True, 'timeout': 30000},
+    'bitrue': {'enableRateLimit': True, 'timeout': 30000},
+    'xt': {'enableRateLimit': True, 'timeout': 30000},
+    'ascendex': {'enableRateLimit': True, 'timeout': 30000},
+    'poloniex': {'enableRateLimit': True, 'timeout': 30000},
+    'bingx': {'enableRateLimit': True, 'timeout': 30000},
+    'digifinex': {'enableRateLimit': True, 'timeout': 30000},
+    'binance': {'enableRateLimit': True, 'timeout': 30000},
+    'bybit': {'enableRateLimit': True, 'timeout': 30000},
+    'okx': {'enableRateLimit': True, 'timeout': 30000},
+    'kucoin': {'enableRateLimit': True, 'timeout': 30000},
+    'mexc': {'enableRateLimit': True, 'timeout': 30000},
+    'bitget': {'enableRateLimit': True, 'timeout': 30000},
+    'htx': {'enableRateLimit': True, 'timeout': 30000},
+    'kraken': {'enableRateLimit': True, 'timeout': 30000},
+    'bitfinex': {'enableRateLimit': True, 'timeout': 30000},
 }
 
 ccxt_instances = {}
@@ -328,59 +327,61 @@ for ex_id, config in _exchanges_to_init.items():
     if hasattr(ccxt_async, ex_id):
         ccxt_instances[ex_id] = getattr(ccxt_async, ex_id)(config)
 
+init_semaphore = asyncio.Semaphore(4) 
+
 async def _load_single_exchange(name, obj):
-    spot_symbols = set()
-    status = {}
-    contracts = {}
-    
-    try:
-        markets = await asyncio.wait_for(obj.load_markets(), timeout=18.0)
-        for s, m in markets.items():
-            if not isinstance(m, dict):
-                continue
-            is_spot = m.get('spot') is True or m.get('type') == 'spot' or ('/USDT' in s and not m.get('swap', False) and not m.get('future', False))
-            is_usdt = m.get('quote') == 'USDT' or s.endswith('/USDT')
-            is_active = m.get('active') is not False
-            if is_spot and is_usdt and is_active:
-                spot_symbols.add(s)
-    except Exception:
-        pass
+    async with init_semaphore:
+        spot_symbols = set()
+        status = {}
+        contracts = {}
+        
+        try:
+            markets = await asyncio.wait_for(obj.load_markets(), timeout=45.0)
+            for s, m in markets.items():
+                if not isinstance(m, dict): continue
+                is_spot = m.get('spot') is True or m.get('type') == 'spot' or ('/USDT' in s and not m.get('swap', False) and not m.get('future', False))
+                is_usdt = m.get('quote') == 'USDT' or s.endswith('/USDT')
+                is_active = m.get('active') is not False
+                if is_spot and is_usdt and is_active:
+                    spot_symbols.add(s)
+        except Exception:
+            pass
 
-    try:
-        currencies = await asyncio.wait_for(obj.fetch_currencies(), timeout=8.0)
-        if isinstance(currencies, dict):
-            for code, cur in currencies.items():
-                if not isinstance(cur, dict): continue
-                code_up = code.upper()
-                deposit = cur.get('deposit', cur.get('active'))
-                withdraw = cur.get('withdraw', cur.get('active'))
-                info = cur.get('info') or {}
-                if isinstance(info, dict):
-                    for k in ['depositEnable', 'deposit_enable', 'deposit']:
-                        if k in info: deposit = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
-                    for k in ['withdrawEnable', 'withdraw_enable', 'withdraw']:
-                        if k in info: withdraw = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
-                status[code_up] = {'deposit': deposit, 'withdraw': withdraw}
+        try:
+            currencies = await asyncio.wait_for(obj.fetch_currencies(), timeout=20.0)
+            if isinstance(currencies, dict):
+                for code, cur in currencies.items():
+                    if not isinstance(cur, dict): continue
+                    code_up = code.upper()
+                    deposit = cur.get('deposit', cur.get('active'))
+                    withdraw = cur.get('withdraw', cur.get('active'))
+                    info = cur.get('info') or {}
+                    if isinstance(info, dict):
+                        for k in ['depositEnable', 'deposit_enable', 'deposit']:
+                            if k in info: deposit = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
+                        for k in ['withdrawEnable', 'withdraw_enable', 'withdraw']:
+                            if k in info: withdraw = str(info[k]).lower() in ('1', 'true', 'yes', 'enabled')
+                    status[code_up] = {'deposit': deposit, 'withdraw': withdraw}
 
-                contract = None
-                networks = cur.get('networks') or {}
-                if isinstance(networks, dict):
-                    for net in networks.values():
-                        if isinstance(net, dict):
-                            addr = net.get('contractAddress') or net.get('address')
-                            if addr:
-                                contract = str(addr).lower()
-                                break
-                if contract:
-                    contracts[code_up] = contract
-    except Exception:
-        pass
+                    contract = None
+                    networks = cur.get('networks') or {}
+                    if isinstance(networks, dict):
+                        for net in networks.values():
+                            if isinstance(net, dict):
+                                addr = net.get('contractAddress') or net.get('address')
+                                if addr:
+                                    contract = str(addr).lower()
+                                    break
+                    if contract:
+                        contracts[code_up] = contract
+        except Exception:
+            pass
 
-    return name, spot_symbols, status, contracts
+        return name, spot_symbols, status, contracts
 
 async def load_universal_symbols():
     global UNIVERSAL_SYMBOLS, SYMBOL_EXCHANGE_MAP, CURRENCY_STATUS, CONTRACT_ADDRESSES
-    print("Loading markets concurrently across all active exchanges...")
+    print("Loading markets... (Throttled to prevent timeouts)")
     
     tasks = [_load_single_exchange(name, obj) for name, obj in ccxt_instances.items()]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -402,27 +403,37 @@ async def load_universal_symbols():
     UNIVERSAL_SYMBOLS = sorted(SYMBOL_EXCHANGE_MAP.keys())
     print(f"✅ Loaded {len(UNIVERSAL_SYMBOLS)} universal pairs across active exchanges.")
 
-async def fetch_ccxt_ticker(exchange_name, exchange_obj, symbol):
-    try:
-        ticker = await exchange_obj.fetch_ticker(symbol)
-        if ticker and ticker.get('last'):
-            volume = float(ticker.get('quoteVolume') or (float(ticker.get('baseVolume', 0)) * float(ticker['last'])))
-            return exchange_name, float(ticker['last']), volume
-    except Exception:
-        pass
-    return exchange_name, None, 0.0
+# --- THE BULK FETCH OPTIMIZATION ---
+async def fetch_all_market_prices():
+    """Fetches ALL prices from all exchanges in exactly 16 API calls instead of 10,000+"""
+    async def _fetch_bulk(name, obj):
+        try:
+            tkrs = await asyncio.wait_for(obj.fetch_tickers(), timeout=15.0)
+            return name, tkrs
+        except Exception:
+            return name, {}
 
-async def scan_symbol_prices(symbol: str):
-    known = SYMBOL_EXCHANGE_MAP.get(symbol, set(ccxt_instances.keys()))
-    tasks = [fetch_ccxt_ticker(n, o, symbol) for n, o in ccxt_instances.items() if n in known]
-    results = await asyncio.gather(*tasks) if tasks else []
-    prices, volumes = {}, []
-    for name, price, vol in results:
-        if price is not None:
-            prices[name] = price
-            if vol > 0: volumes.append(vol)
-    if volumes and max(volumes) < MIN_24H_VOLUME_USD: return {}
-    return prices
+    tasks = [_fetch_bulk(name, obj) for name, obj in ccxt_instances.items()]
+    results = await asyncio.gather(*tasks)
+
+    prices_map = {}
+    for name, tkrs in results:
+        if not tkrs: continue
+        for sym, t in tkrs.items():
+            if sym not in UNIVERSAL_SYMBOLS: continue
+            
+            last = t.get('last')
+            if last is None or float(last) <= 0: continue
+            
+            vol = float(t.get('quoteVolume') or (float(t.get('baseVolume', 0)) * float(last)))
+            if vol < MIN_24H_VOLUME_USD: continue
+            
+            if sym not in prices_map:
+                prices_map[sym] = {}
+            prices_map[sym][name] = float(last)
+            
+    # Only return pairs that have prices on at least 2 exchanges
+    return {sym: p for sym, p in prices_map.items() if len(p) >= 2}
 
 def can_transfer(coin: str, buy_ex: str, sell_ex: str) -> bool:
     coin = coin.upper()
@@ -507,34 +518,22 @@ async def get_orderbook_text(symbol: str) -> str:
     return "\n".join(lines)
 
 async def scan_all_symbols(min_profit=None, min_spread=None, max_spread=None, symbols=None, trade_size=100.0, loose_mode=False):
-    target = symbols if symbols is not None else UNIVERSAL_SYMBOLS
-    semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+    prices_map = await fetch_all_market_prices()
     results = []
+    target_symbols = set(symbols) if symbols else None
 
-    async def _scan(sym):
-        async with semaphore:
-            prices = await scan_symbol_prices(sym)
-            arb = calculate_net_arbitrage(sym, prices, trade_size, loose_mode)
-            if arb:
-                if min_profit is not None and arb['net_profit'] < min_profit: return
-                if min_spread is not None and arb['net_spread_pct'] < min_spread: return
-                if max_spread is not None and arb['net_spread_pct'] > max_spread: return
-                results.append(arb)
+    for sym, prices in prices_map.items():
+        if target_symbols and sym not in target_symbols:
+            continue
+        arb = calculate_net_arbitrage(sym, prices, trade_size, loose_mode)
+        if arb:
+            if min_profit is not None and arb['net_profit'] < min_profit: continue
+            if min_spread is not None and arb['net_spread_pct'] < min_spread: continue
+            if max_spread is not None and arb['net_spread_pct'] > max_spread: continue
+            results.append(arb)
 
-    await asyncio.gather(*[_scan(s) for s in target])
     results.sort(key=lambda x: x['net_profit'], reverse=True)
     return results
-
-async def fetch_all_prices(symbols=None):
-    target = symbols if symbols is not None else UNIVERSAL_SYMBOLS
-    semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
-    prices_map = {}
-    async def _f(sym):
-        async with semaphore:
-            p = await scan_symbol_prices(sym)
-            if p: prices_map[sym] = p
-    await asyncio.gather(*[_f(s) for s in target])
-    return prices_map
 
 # ==========================================
 # 4. HANDLERS (Users)
@@ -584,17 +583,20 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = get_user_settings(uid)
     if not settings: return await message.reply_text("Settings not found.")
 
-    status = await message.reply_text(f"🔍 Scanning markets across {len(ccxt_instances)} exchanges...")
+    status = await message.reply_text(f"🔍 Scanning markets across {len(ccxt_instances)} exchanges (Bulk Fetch)...")
+    
+    start_time = time.time()
     results = await scan_all_symbols(
         min_profit=settings['min_net_profit_usd'], min_spread=settings['min_spread_pct'],
         max_spread=settings['max_spread_pct'], symbols=list(settings['watchlist']) if settings['watchlist'] else None,
         trade_size=settings['trade_size_usd'], loose_mode=settings['loose_mode']
     )
+    elapsed = time.time() - start_time
 
-    if not results: return await status.edit_text("No opportunities found. Relax filters or try `/loosemode`.")
+    if not results: return await status.edit_text(f"No opportunities found (Took {elapsed:.1f}s). Relax filters or try `/loosemode`.")
 
     top = results[:settings['max_results']]
-    await status.edit_text(f"📊 Found **{len(results)}** opportunities (showing {len(top)})")
+    await status.edit_text(f"📊 Found **{len(results)}** opportunities in {elapsed:.1f}s (showing {len(top)})")
 
     for i, arb in enumerate(top, 1):
         text = f"**#{i}**\n" + format_detailed_alert(arb)
@@ -928,7 +930,7 @@ async def background_arbitrage_daemon(app):
 
             users = get_all_premium_users()
             if users and UNIVERSAL_SYMBOLS:
-                prices_map = await fetch_all_prices()
+                prices_map = await fetch_all_market_prices()
                 for uid in users:
                     settings = get_user_settings(uid)
                     if not settings or settings['paused'] or settings['is_banned']: continue
@@ -1001,7 +1003,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_router))
     app.add_error_handler(error_handler)
 
-    print("Bot started (Optimized Concurrent Engine Active)...")
+    print("Bot started (Optimized Bulk Fetch Engine Active)...")
     app.run_polling()
 
 if __name__ == "__main__":

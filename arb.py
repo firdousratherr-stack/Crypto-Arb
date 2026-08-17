@@ -171,10 +171,18 @@ def get_user_settings(user_id: int):
         FROM users WHERE user_id = ?
     """, (user_id,))
     row = c.fetchone()
-    if not row:
+    
+    # If the database was wiped but you are the hardcoded admin, create default settings on the fly
+    if not row and user_id == 1140410671:
+        c.execute("INSERT OR IGNORE INTO users (user_id, username, is_premium, registered_at) VALUES (?, ?, 1, ?)", (user_id, "Admin", now_ist()))
+        conn.commit()
+        trade_size, min_profit, min_spread, max_spread, max_results, paused, is_banned, loose_mode, paper_balance = (100.0, 5.0, 0.5, 50.0, 15, 0, 0, 0, 0.0)
+    elif not row:
         conn.close()
         return None
-    trade_size, min_profit, min_spread, max_spread, max_results, paused, is_banned, loose_mode, paper_balance = row
+    else:
+        trade_size, min_profit, min_spread, max_spread, max_results, paused, is_banned, loose_mode, paper_balance = row
+
     c.execute("SELECT symbol FROM watchlist WHERE user_id = ?", (user_id,))
     watchlist = {s.upper() for (s,) in c.fetchall()}
     conn.close()
@@ -200,7 +208,11 @@ def toggle_loose_mode_db(user_id: int) -> bool:
     conn = sqlite3.connect("arbitrage_users.db")
     c = conn.cursor()
     c.execute("SELECT loose_mode FROM users WHERE user_id = ?", (user_id,))
-    current = c.fetchone()[0]
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False
+    current = row[0]
     new_val = 0 if current else 1
     c.execute("UPDATE users SET loose_mode = ? WHERE user_id = ?", (new_val, user_id))
     conn.commit()
@@ -221,6 +233,11 @@ def get_paper_leaderboard():
     return rows
 
 def is_user_premium(user_id: int) -> bool:
+    # --- PERMANENT ADMIN BYPASS ---
+    if user_id == 1140410671:
+        return True
+    # ------------------------------
+    
     conn = sqlite3.connect("arbitrage_users.db")
     c = conn.cursor()
     c.execute("SELECT is_premium, is_banned FROM users WHERE user_id = ?", (user_id,))
@@ -252,7 +269,14 @@ def get_all_premium_users():
     c.execute("SELECT user_id FROM users WHERE is_premium=1 AND is_banned=0")
     rows = c.fetchall()
     conn.close()
-    return [r[0] for r in rows]
+    
+    # Always include the hardcoded admin id in the broadcast list
+    admin_id = 1140410671
+    user_ids = [r[0] for r in rows]
+    if admin_id not in user_ids:
+        user_ids.append(admin_id)
+        
+    return user_ids
 
 def get_all_users_detailed():
     conn = sqlite3.connect("arbitrage_users.db")

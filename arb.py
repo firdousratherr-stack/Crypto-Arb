@@ -27,7 +27,6 @@ DEFAULT_MIN_PROFIT_USER = 5.0
 DEFAULT_MIN_SPREAD_PCT = 0.5
 DEFAULT_MAX_SPREAD_PCT = 50.0
 DEFAULT_MAX_RESULTS = 15
-SCAN_CONCURRENCY = 16
 
 MIN_24H_VOLUME_USD = 40000
 GENERIC_WITHDRAW_FEE_COIN_UNITS = 1.0
@@ -795,15 +794,15 @@ async def post_init(app):
         if hasattr(ccxt_async, ex_id):
             ccxt_instances[ex_id] = getattr(ccxt_async, ex_id)(config)
             
-        print("Bot started (High-speed CCXT instances bound)...")
-    app.run_polling(drop_pending_updates=True)
-    
+    print("✅ High-speed CCXT instances bound.")
     asyncio.create_task(background_daemon(app))
 
 async def post_shutdown(app):
     for o in ccxt_instances.values():
-        try: await o.close()
-        except Exception: pass
+        try: 
+            await o.close()
+        except Exception: 
+            pass
 
 def main():
     init_db()
@@ -828,7 +827,9 @@ def main():
     for cmd, func in handlers: app.add_handler(CommandHandler(cmd, func))
 
     app.add_handler(CallbackQueryHandler(button_router))
-    app.run_polling()
+    
+    print("Bot started with drop_pending_updates enabled...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()

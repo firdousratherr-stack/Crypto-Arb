@@ -795,7 +795,9 @@ async def post_init(app):
         if hasattr(ccxt_async, ex_id):
             ccxt_instances[ex_id] = getattr(ccxt_async, ex_id)(config)
             
-    print("✅ High-speed CCXT instances bound.")
+        print("Bot started (High-speed CCXT instances bound)...")
+    app.run_polling(drop_pending_updates=True)
+    
     asyncio.create_task(background_daemon(app))
 
 async def post_shutdown(app):

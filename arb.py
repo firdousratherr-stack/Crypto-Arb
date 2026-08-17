@@ -281,31 +281,38 @@ def get_user_full_info(user_id: int):
     }
 
 # ==========================================
-# 3. MARKET ENGINE
+# 3. MARKET ENGINE (Dynamic Loader)
 # ==========================================
-ccxt_instances = {
-    'gate': ccxt_async.gate({'enableRateLimit': True, 'timeout': 25000, 'options': {'defaultType': 'spot'}}),
-    'lbank': ccxt_async.lbank({'enableRateLimit': True, 'timeout': 25000}),
-    'bitrue': ccxt_async.bitrue({'enableRateLimit': True, 'timeout': 25000}),
-    'xt': ccxt_async.xt({'enableRateLimit': True, 'timeout': 25000}),
-    'ascendex': ccxt_async.ascendex({'enableRateLimit': True, 'timeout': 25000}),
-    'poloniex': ccxt_async.poloniex({'enableRateLimit': True, 'timeout': 25000}),
-    'bingx': ccxt_async.bingx({'enableRateLimit': True, 'timeout': 25000}),
-    'digifinex': ccxt_async.digifinex({'enableRateLimit': True, 'timeout': 25000}),
-    'binance': ccxt_async.binance({'enableRateLimit': True, 'timeout': 25000}),
-    'bybit': ccxt_async.bybit({'enableRateLimit': True, 'timeout': 25000}),
-    'okx': ccxt_async.okx({'enableRateLimit': True, 'timeout': 25000}),
-    'kucoin': ccxt_async.kucoin({'enableRateLimit': True, 'timeout': 25000}),
-    'mexc': ccxt_async.mexc({'enableRateLimit': True, 'timeout': 25000}),
-    'bitget': ccxt_async.bitget({'enableRateLimit': True, 'timeout': 25000}),
-    'htx': ccxt_async.htx({'enableRateLimit': True, 'timeout': 25000}),
-    'kraken': ccxt_async.kraken({'enableRateLimit': True, 'timeout': 25000}),
-    'bitfinex': ccxt_async.bitfinex({'enableRateLimit': True, 'timeout': 25000}),
+_exchanges_to_init = {
+    'gate': {'enableRateLimit': True, 'timeout': 25000, 'options': {'defaultType': 'spot'}},
+    'lbank': {'enableRateLimit': True, 'timeout': 25000},
+    'bitrue': {'enableRateLimit': True, 'timeout': 25000},
+    'xt': {'enableRateLimit': True, 'timeout': 25000},
+    'ascendex': {'enableRateLimit': True, 'timeout': 25000},
+    'poloniex': {'enableRateLimit': True, 'timeout': 25000},
+    'bingx': {'enableRateLimit': True, 'timeout': 25000},
+    'digifinex': {'enableRateLimit': True, 'timeout': 25000},
+    'binance': {'enableRateLimit': True, 'timeout': 25000},
+    'bybit': {'enableRateLimit': True, 'timeout': 25000},
+    'okx': {'enableRateLimit': True, 'timeout': 25000},
+    'kucoin': {'enableRateLimit': True, 'timeout': 25000},
+    'mexc': {'enableRateLimit': True, 'timeout': 25000},
+    'bitget': {'enableRateLimit': True, 'timeout': 25000},
+    'htx': {'enableRateLimit': True, 'timeout': 25000},
+    'kraken': {'enableRateLimit': True, 'timeout': 25000},
+    'bitfinex': {'enableRateLimit': True, 'timeout': 25000},
 }
+
+ccxt_instances = {}
+for ex_id, config in _exchanges_to_init.items():
+    if hasattr(ccxt_async, ex_id):
+        ccxt_instances[ex_id] = getattr(ccxt_async, ex_id)(config)
+    else:
+        print(f"⚠️ Warning: Exchange '{ex_id}' not found in installed CCXT version. Skipping.")
 
 async def load_universal_symbols():
     global UNIVERSAL_SYMBOLS, SYMBOL_EXCHANGE_MAP, CURRENCY_STATUS, CONTRACT_ADDRESSES
-    print("Loading markets across all exchanges...")
+    print("Loading markets across all active exchanges...")
     exchange_markets = {}
     
     for name, obj in ccxt_instances.items():
@@ -820,7 +827,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is healthy!")
         
     def log_message(self, format, *args):
-        pass # Suppress logging to keep console clean
+        pass
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
@@ -958,7 +965,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_router))
     app.add_error_handler(error_handler)
 
-    print("Bot started (All 17 exchanges, Loose Mode, Paper Trading & Admin controls active)...")
+    print("Bot started (All exchanges loading dynamically, Loose Mode, Paper Trading & Admin controls active)...")
     app.run_polling()
 
 if __name__ == "__main__":

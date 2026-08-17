@@ -38,7 +38,20 @@ EXCHANGE_CONFIG = {
     'gate': {'fee': 0.002, 'withdraw_fees': {'BTC': 0.0001, 'ETH': 0.002, 'SOL': 0.01, 'XRP': 0.5, 'DOGE': 5.0}},
     'lbank': {'fee': 0.001, 'withdraw_fees': {'BTC': 0.0002, 'ETH': 0.003, 'SOL': 0.015, 'XRP': 1.0, 'DOGE': 10.0}},
     'bitrue': {'fee': 0.002, 'withdraw_fees': {'BTC': 0.00015, 'ETH': 0.0025, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 6.0}},
-    'xt': {'fee': 0.002, 'withdraw_fees': {'BTC': 0.0002, 'ETH': 0.003, 'SOL': 0.02, 'XRP': 0.8, 'DOGE': 8.0}}
+    'xt': {'fee': 0.002, 'withdraw_fees': {'BTC': 0.0002, 'ETH': 0.003, 'SOL': 0.02, 'XRP': 0.8, 'DOGE': 8.0}},
+    'ascendex': {'fee': 0.002, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.005, 'SOL': 0.01, 'XRP': 1.0, 'DOGE': 10.0}},
+    'poloniex': {'fee': 0.00145, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.005, 'SOL': 0.01, 'XRP': 1.0, 'DOGE': 10.0}},
+    'bingx': {'fee': 0.001, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.005, 'SOL': 0.01, 'XRP': 1.0, 'DOGE': 10.0}},
+    'digifinex': {'fee': 0.002, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.005, 'SOL': 0.01, 'XRP': 1.0, 'DOGE': 10.0}},
+    'binance': {'fee': 0.001, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.002, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 4.0}},
+    'bybit': {'fee': 0.001, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.002, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 5.0}},
+    'okx': {'fee': 0.001, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.002, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 5.0}},
+    'kucoin': {'fee': 0.001, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.002, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 5.0}},
+    'mexc': {'fee': 0.001, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.002, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 5.0}},
+    'bitget': {'fee': 0.001, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.002, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 5.0}},
+    'htx': {'fee': 0.002, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.002, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 5.0}},
+    'kraken': {'fee': 0.0026, 'withdraw_fees': {'BTC': 0.0005, 'ETH': 0.002, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 5.0}},
+    'bitfinex': {'fee': 0.002, 'withdraw_fees': {'BTC': 0.0004, 'ETH': 0.0013, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 5.0}}
 }
 
 UNIVERSAL_SYMBOLS = []
@@ -274,7 +287,21 @@ ccxt_instances = {
     'lbank': ccxt_async.lbank({'enableRateLimit': True, 'timeout': 25000}),
     'bitrue': ccxt_async.bitrue({'enableRateLimit': True, 'timeout': 25000}),
     'xt': ccxt_async.xt({'enableRateLimit': True, 'timeout': 25000}),
+    'ascendex': ccxt_async.ascendex({'enableRateLimit': True, 'timeout': 25000}),
+    'poloniex': ccxt_async.poloniex({'enableRateLimit': True, 'timeout': 25000}),
+    'bingx': ccxt_async.bingx({'enableRateLimit': True, 'timeout': 25000}),
+    'digifinex': ccxt_async.digifinex({'enableRateLimit': True, 'timeout': 25000}),
+    'binance': ccxt_async.binance({'enableRateLimit': True, 'timeout': 25000}),
+    'bybit': ccxt_async.bybit({'enableRateLimit': True, 'timeout': 25000}),
+    'okx': ccxt_async.okx({'enableRateLimit': True, 'timeout': 25000}),
+    'kucoin': ccxt_async.kucoin({'enableRateLimit': True, 'timeout': 25000}),
+    'mexc': ccxt_async.mexc({'enableRateLimit': True, 'timeout': 25000}),
+    'bitget': ccxt_async.bitget({'enableRateLimit': True, 'timeout': 25000}),
+    'htx': ccxt_async.htx({'enableRateLimit': True, 'timeout': 25000}),
+    'kraken': ccxt_async.kraken({'enableRateLimit': True, 'timeout': 25000}),
+    'bitfinex': ccxt_async.bitfinex({'enableRateLimit': True, 'timeout': 25000}),
 }
+
 
 async def load_universal_symbols():
     global UNIVERSAL_SYMBOLS, SYMBOL_EXCHANGE_MAP, CURRENCY_STATUS, CONTRACT_ADDRESSES

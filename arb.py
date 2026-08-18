@@ -2,17 +2,21 @@ import asyncio
 import os
 import sqlite3
 import time
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import logging
 from datetime import datetime, timezone, timedelta
 import ccxt.async_support as ccxt_async
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     CallbackQueryHandler
 )
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # ==========================================
 # 1. CONFIGURATION
@@ -21,16 +25,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8848406877:AAHuBsI_IXmFTvVg8EKu-r7XZm9G
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "X")
 ADMIN_USER_ID = 1140410671  # Hardcoded Premium Admin ID
 
-SCAN_INTERVAL_SECONDS = 30
+SCAN_INTERVAL_SECONDS = 25
 DEFAULT_TRADE_SIZE_USD = 100.0
-DEFAULT_MIN_PROFIT_USER = 5.0
-DEFAULT_MIN_SPREAD_PCT = 0.5
-DEFAULT_MAX_SPREAD_PCT = 50.0
-DEFAULT_MAX_RESULTS = 15
-
-MIN_24H_VOLUME_USD = 40000
+MIN_24H_VOLUME_USD = 30000
 GENERIC_WITHDRAW_FEE_COIN_UNITS = 1.0
-CURRENCY_REFRESH_SECONDS = 1800
+CURRENCY_REFRESH_SECONDS = 3600
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -54,16 +53,25 @@ EXCHANGE_CONFIG = {
     'bitfinex': {'fee': 0.002, 'withdraw_fees': {'BTC': 0.0004, 'ETH': 0.0013, 'SOL': 0.01, 'XRP': 0.2, 'DOGE': 5.0}}
 }
 
+# In-Memory Cache Structures
 UNIVERSAL_SYMBOLS = []
 SYMBOL_EXCHANGE_MAP = {}
+GLOBAL_PRICE_CACHE = {}
+LAST_PRICE_UPDATE = 0
+CACHE_LOCK = asyncio.Lock()
+ccxt_instances = {}
 
 # ==========================================
-# 2. DATABASE & LOGGING
+# 2. DATABASE & STATE MANAGEMENT
 # ==========================================
+def get_db():
+    conn = sqlite3.connect("arbitrage_users.db", timeout=15.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
 def init_db():
-    conn = sqlite3.connect("arbitrage_users.db")
+    conn = get_db()
     c = conn.cursor()
-
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -83,7 +91,6 @@ def init_db():
             last_active TEXT
         )
     """)
-
     c.execute("""
         CREATE TABLE IF NOT EXISTS access_keys (
             key_code TEXT PRIMARY KEY,
@@ -91,7 +98,6 @@ def init_db():
             used_by INTEGER
         )
     """)
-
     c.execute("""
         CREATE TABLE IF NOT EXISTS watchlist (
             user_id INTEGER NOT NULL,
@@ -100,7 +106,6 @@ def init_db():
             PRIMARY KEY (user_id, symbol)
         )
     """)
-
     c.execute("""
         CREATE TABLE IF NOT EXISTS user_actions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +114,6 @@ def init_db():
             created_at TEXT
         )
     """)
-
     c.execute("INSERT OR IGNORE INTO access_keys (key_code) VALUES ('VIP-ALPHA-2026'), ('VIP-BETA-777'), ('VIP-PRO-999')")
     conn.commit()
     conn.close()
@@ -118,186 +122,183 @@ def now_ist():
     return datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p")
 
 def log_action(user_id: int, action: str):
-    now = now_ist()
-    conn = sqlite3.connect("arbitrage_users.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO user_actions (user_id, action, created_at) VALUES (?, ?, ?)", (user_id, action, now))
-    c.execute("UPDATE users SET last_action = ?, last_active = ? WHERE user_id = ?", (action, now, user_id))
-    c.execute("""
-        DELETE FROM user_actions 
-        WHERE user_id = ? AND id NOT IN (
-            SELECT id FROM user_actions WHERE user_id = ? ORDER BY id DESC LIMIT 40
-        )
-    """, (user_id, user_id))
-    conn.commit()
-    conn.close()
-
-def get_user_actions(user_id: int, limit: int = 15):
-    conn = sqlite3.connect("arbitrage_users.db")
-    c = conn.cursor()
-    c.execute("SELECT action, created_at FROM user_actions WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    try:
+        now = now_ist()
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("INSERT INTO user_actions (user_id, action, created_at) VALUES (?, ?, ?)", (user_id, action, now))
+        c.execute("UPDATE users SET last_action = ?, last_active = ? WHERE user_id = ?", (action, now, user_id))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 def get_user_settings(user_id: int):
-    conn = sqlite3.connect("arbitrage_users.db")
-    c = conn.cursor()
-    c.execute("""
-        SELECT trade_size_usd, min_net_profit_usd, min_spread_pct, max_spread_pct, 
-               max_results, paused, is_banned, loose_mode, paper_balance 
-        FROM users WHERE user_id = ?
-    """, (user_id,))
-    row = c.fetchone()
-    
-    if not row and user_id == ADMIN_USER_ID:
-        c.execute("INSERT OR IGNORE INTO users (user_id, username, is_premium, registered_at) VALUES (?, ?, 1, ?)", (user_id, "Admin", now_ist()))
-        conn.commit()
-        trade_size, min_profit, min_spread, max_spread, max_results, paused, is_banned, loose_mode, paper_balance = (100.0, 5.0, 0.5, 50.0, 15, 0, 0, 0, 0.0)
-    elif not row:
-        conn.close()
-        return None
-    else:
-        trade_size, min_profit, min_spread, max_spread, max_results, paused, is_banned, loose_mode, paper_balance = row
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("""
+            SELECT trade_size_usd, min_net_profit_usd, min_spread_pct, max_spread_pct, 
+                   max_results, paused, is_banned, loose_mode, paper_balance 
+            FROM users WHERE user_id = ?
+        """, (user_id,))
+        row = c.fetchone()
+        
+        if not row and user_id == ADMIN_USER_ID:
+            c.execute("INSERT OR IGNORE INTO users (user_id, username, is_premium, registered_at) VALUES (?, ?, 1, ?)", (user_id, "Admin", now_ist()))
+            conn.commit()
+            trade_size, min_profit, min_spread, max_spread, max_results, paused, is_banned, loose_mode, paper_balance = (100.0, 5.0, 0.5, 50.0, 15, 0, 0, 0, 0.0)
+        elif not row:
+            conn.close()
+            return None
+        else:
+            trade_size, min_profit, min_spread, max_spread, max_results, paused, is_banned, loose_mode, paper_balance = row
 
-    c.execute("SELECT symbol FROM watchlist WHERE user_id = ?", (user_id,))
-    watchlist = {s.upper() for (s,) in c.fetchall()}
-    conn.close()
-    return {
-        'trade_size_usd': trade_size, 'min_net_profit_usd': min_profit, 'min_spread_pct': min_spread,
-        'max_spread_pct': max_spread, 'max_results': max_results, 'paused': bool(paused),
-        'is_banned': bool(is_banned), 'loose_mode': bool(loose_mode), 'paper_balance': paper_balance, 'watchlist': watchlist
-    }
+        c.execute("SELECT symbol FROM watchlist WHERE user_id = ?", (user_id,))
+        watchlist = {s.upper() for (s,) in c.fetchall()}
+        conn.close()
+        return {
+            'trade_size_usd': trade_size, 'min_net_profit_usd': min_profit, 'min_spread_pct': min_spread,
+            'max_spread_pct': max_spread, 'max_results': max_results, 'paused': bool(paused),
+            'is_banned': bool(is_banned), 'loose_mode': bool(loose_mode), 'paper_balance': paper_balance, 'watchlist': watchlist
+        }
+    except Exception:
+        return None
 
 def update_user_setting(user_id: int, field: str, amount):
-    conn = sqlite3.connect("arbitrage_users.db")
-    conn.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (amount, user_id)).connection.commit()
-    conn.close()
+    try:
+        conn = get_db()
+        conn.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (amount, user_id))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 def toggle_loose_mode_db(user_id: int) -> bool:
-    conn = sqlite3.connect("arbitrage_users.db")
-    c = conn.cursor()
-    c.execute("SELECT loose_mode FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    if not row:
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT loose_mode FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return False
+        new_val = 0 if row[0] else 1
+        c.execute("UPDATE users SET loose_mode = ? WHERE user_id = ?", (new_val, user_id))
+        conn.commit()
         conn.close()
+        return bool(new_val)
+    except Exception:
         return False
-    new_val = 0 if row[0] else 1
-    c.execute("UPDATE users SET loose_mode = ? WHERE user_id = ?", (new_val, user_id))
-    conn.commit()
-    conn.close()
-    return bool(new_val)
 
 def add_paper_profit(user_id: int, amount: float):
-    conn = sqlite3.connect("arbitrage_users.db")
-    conn.execute("UPDATE users SET paper_balance = paper_balance + ? WHERE user_id = ?", (amount, user_id)).connection.commit()
-    conn.close()
+    try:
+        conn = get_db()
+        conn.execute("UPDATE users SET paper_balance = paper_balance + ? WHERE user_id = ?", (amount, user_id))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 def get_paper_leaderboard():
-    conn = sqlite3.connect("arbitrage_users.db")
-    c = conn.cursor()
-    c.execute("SELECT username, paper_balance FROM users WHERE paper_balance > 0 ORDER BY paper_balance DESC LIMIT 10")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT username, paper_balance FROM users WHERE paper_balance > 0 ORDER BY paper_balance DESC LIMIT 10")
+        rows = c.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
 
 def is_user_premium(user_id: int) -> bool:
     if user_id == ADMIN_USER_ID:
         return True
-    conn = sqlite3.connect("arbitrage_users.db")
-    c = conn.cursor()
-    c.execute("SELECT is_premium, is_banned FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return bool(row and row[0] == 1 and row[1] == 0)
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT is_premium, is_banned FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        return bool(row and row[0] == 1 and row[1] == 0)
+    except Exception:
+        return False
 
 def activate_user_key(user_id: int, username: str, key_code: str) -> bool:
-    conn = sqlite3.connect("arbitrage_users.db")
-    c = conn.cursor()
-    c.execute("SELECT is_used FROM access_keys WHERE key_code = ?", (key_code,))
-    row = c.fetchone()
-    if not row or row[0] != 0:
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT is_used FROM access_keys WHERE key_code = ?", (key_code,))
+        row = c.fetchone()
+        if not row or row[0] != 0:
+            conn.close()
+            return False
+        c.execute("UPDATE access_keys SET is_used = 1, used_by = ? WHERE key_code = ?", (user_id, key_code))
+        c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        if c.fetchone():
+            c.execute("UPDATE users SET username=?, is_premium=1, is_banned=0, registered_at=? WHERE user_id=?", (username, now_ist(), user_id))
+        else:
+            c.execute("INSERT INTO users (user_id, username, is_premium, registered_at) VALUES (?,?,1,?)", (user_id, username, now_ist()))
+        conn.commit()
         conn.close()
+        return True
+    except Exception:
         return False
-    c.execute("UPDATE access_keys SET is_used = 1, used_by = ? WHERE key_code = ?", (user_id, key_code))
-    c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    if c.fetchone():
-        c.execute("UPDATE users SET username=?, is_premium=1, is_banned=0, registered_at=? WHERE user_id=?", (username, now_ist(), user_id))
-    else:
-        c.execute("INSERT INTO users (user_id, username, is_premium, registered_at) VALUES (?,?,1,?)", (user_id, username, now_ist()))
-    conn.commit()
-    conn.close()
-    return True
 
 def get_all_premium_users():
-    conn = sqlite3.connect("arbitrage_users.db")
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE is_premium=1 AND is_banned=0")
-    rows = c.fetchall()
-    conn.close()
-    user_ids = [r[0] for r in rows]
-    if ADMIN_USER_ID not in user_ids:
-        user_ids.append(ADMIN_USER_ID)
-    return user_ids
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE is_premium=1 AND is_banned=0")
+        rows = c.fetchall()
+        conn.close()
+        user_ids = [r[0] for r in rows]
+        if ADMIN_USER_ID not in user_ids:
+            user_ids.append(ADMIN_USER_ID)
+        return user_ids
+    except Exception:
+        return [ADMIN_USER_ID]
 
 def get_all_users_detailed():
-    conn = sqlite3.connect("arbitrage_users.db")
-    c = conn.cursor()
-    c.execute("SELECT user_id, username, is_premium, is_banned, registered_at, trade_size_usd, min_net_profit_usd, paused, last_action, last_active FROM users ORDER BY last_active DESC NULLS LAST")
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def get_user_full_info(user_id: int):
-    conn = sqlite3.connect("arbitrage_users.db")
-    c = conn.cursor()
-    c.execute("SELECT user_id, username, is_premium, is_banned, registered_at, trade_size_usd, min_net_profit_usd, min_spread_pct, max_spread_pct, max_results, paused, last_action, last_active, loose_mode, paper_balance FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    if not row:
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT user_id, username, is_premium, is_banned, registered_at, trade_size_usd, min_net_profit_usd, paused, last_action, last_active FROM users ORDER BY last_active DESC NULLS LAST")
+        rows = c.fetchall()
         conn.close()
-        return None
-    c.execute("SELECT symbol FROM watchlist WHERE user_id = ?", (user_id,))
-    watchlist = [r[0] for r in c.fetchall()]
-    conn.close()
-    return {
-        "user_id": row[0], "username": row[1], "is_premium": bool(row[2]), "is_banned": bool(row[3]), "registered_at": row[4],
-        "trade_size_usd": row[5], "min_net_profit_usd": row[6], "min_spread_pct": row[7], "max_spread_pct": row[8],
-        "max_results": row[9], "paused": bool(row[10]), "last_action": row[11], "last_active": row[12], 
-        "loose_mode": bool(row[13]), "paper_balance": row[14], "watchlist": watchlist
-    }
+        return rows
+    except Exception:
+        return []
 
 # ==========================================
-# 3. LIGHTNING-FAST MARKET ENGINE
+# 3. MARKET ENGINE (CACHE-DRIVEN)
 # ==========================================
 _exchanges_to_init = {
-    'gate': {'enableRateLimit': True, 'timeout': 15000, 'options': {'defaultType': 'spot'}},
-    'lbank': {'enableRateLimit': True, 'timeout': 15000},
-    'bitrue': {'enableRateLimit': True, 'timeout': 15000},
-    'xt': {'enableRateLimit': True, 'timeout': 15000},
-    'ascendex': {'enableRateLimit': True, 'timeout': 15000},
-    'poloniex': {'enableRateLimit': True, 'timeout': 15000},
-    'bingx': {'enableRateLimit': True, 'timeout': 15000},
-    'digifinex': {'enableRateLimit': True, 'timeout': 15000},
-    'binance': {'enableRateLimit': True, 'timeout': 15000},
-    'bybit': {'enableRateLimit': True, 'timeout': 15000},
-    'okx': {'enableRateLimit': True, 'timeout': 15000},
-    'kucoin': {'enableRateLimit': True, 'timeout': 15000},
-    'mexc': {'enableRateLimit': True, 'timeout': 15000},
-    'bitget': {'enableRateLimit': True, 'timeout': 15000},
-    'htx': {'enableRateLimit': True, 'timeout': 15000},
-    'kraken': {'enableRateLimit': True, 'timeout': 15000},
-    'bitfinex': {'enableRateLimit': True, 'timeout': 15000},
+    'gate': {'enableRateLimit': True, 'timeout': 8000, 'options': {'defaultType': 'spot'}},
+    'lbank': {'enableRateLimit': True, 'timeout': 8000},
+    'bitrue': {'enableRateLimit': True, 'timeout': 8000},
+    'xt': {'enableRateLimit': True, 'timeout': 8000},
+    'ascendex': {'enableRateLimit': True, 'timeout': 8000},
+    'poloniex': {'enableRateLimit': True, 'timeout': 8000},
+    'bingx': {'enableRateLimit': True, 'timeout': 8000},
+    'digifinex': {'enableRateLimit': True, 'timeout': 8000},
+    'binance': {'enableRateLimit': True, 'timeout': 8000},
+    'bybit': {'enableRateLimit': True, 'timeout': 8000},
+    'okx': {'enableRateLimit': True, 'timeout': 8000},
+    'kucoin': {'enableRateLimit': True, 'timeout': 8000},
+    'mexc': {'enableRateLimit': True, 'timeout': 8000},
+    'bitget': {'enableRateLimit': True, 'timeout': 8000},
+    'htx': {'enableRateLimit': True, 'timeout': 8000},
+    'kraken': {'enableRateLimit': True, 'timeout': 8000},
+    'bitfinex': {'enableRateLimit': True, 'timeout': 8000},
 }
 
-ccxt_instances = {}
-
-async def _load_fast_exchange(name, obj):
+async def _load_single_exchange(name, obj):
     spot_symbols = set()
     try:
-        markets = await asyncio.wait_for(obj.load_markets(), timeout=20.0)
+        markets = await asyncio.wait_for(obj.load_markets(), timeout=12.0)
         for s, m in markets.items():
-            if not isinstance(m, dict): continue
-            if m.get('spot') and m.get('quote') == 'USDT' and m.get('active') is not False:
+            if isinstance(m, dict) and m.get('spot') and m.get('quote') == 'USDT' and m.get('active') is not False:
                 spot_symbols.add(s)
     except Exception:
         pass
@@ -305,39 +306,44 @@ async def _load_fast_exchange(name, obj):
 
 async def load_universal_symbols():
     global UNIVERSAL_SYMBOLS, SYMBOL_EXCHANGE_MAP
-    print("⚡ Fast loading markets concurrently...")
-    
-    tasks = [_load_fast_exchange(name, obj) for name, obj in ccxt_instances.items()]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        logger.info("Updating market pairings across exchanges...")
+        tasks = [_load_single_exchange(name, obj) for name, obj in ccxt_instances.items()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    exchange_markets = {}
-    for res in results:
-        if isinstance(res, tuple):
-            name, spot_symbols = res
-            exchange_markets[name] = spot_symbols
+        exchange_markets = {}
+        for res in results:
+            if isinstance(res, tuple):
+                name, spot_symbols = res
+                exchange_markets[name] = spot_symbols
 
-    symbol_to_exchanges = {}
-    for name, syms in exchange_markets.items():
-        for s in syms:
-            symbol_to_exchanges.setdefault(s, set()).add(name)
-            
-    SYMBOL_EXCHANGE_MAP = {s: exs for s, exs in symbol_to_exchanges.items() if len(exs) >= 2}
-    UNIVERSAL_SYMBOLS = sorted(SYMBOL_EXCHANGE_MAP.keys())
-    print(f"✅ Fast Loaded {len(UNIVERSAL_SYMBOLS)} universal pairs.")
+        symbol_to_exchanges = {}
+        for name, syms in exchange_markets.items():
+            for s in syms:
+                symbol_to_exchanges.setdefault(s, set()).add(name)
 
-async def fetch_all_market_prices():
-    async def _fetch_bulk(name, obj):
+        SYMBOL_EXCHANGE_MAP = {s: exs for s, exs in symbol_to_exchanges.items() if len(exs) >= 2}
+        UNIVERSAL_SYMBOLS = sorted(SYMBOL_EXCHANGE_MAP.keys())
+        logger.info(f"Loaded {len(UNIVERSAL_SYMBOLS)} universal pairs across active exchanges.")
+    except Exception as e:
+        logger.error(f"Error in load_universal_symbols: {e}")
+
+async def refresh_global_prices():
+    global GLOBAL_PRICE_CACHE, LAST_PRICE_UPDATE
+    async def _fetch_single(name, obj):
         try:
-            tkrs = await asyncio.wait_for(obj.fetch_tickers(), timeout=12.0)
+            tkrs = await asyncio.wait_for(obj.fetch_tickers(), timeout=7.0)
             return name, tkrs
         except Exception:
             return name, {}
 
-    tasks = [_fetch_bulk(name, obj) for name, obj in ccxt_instances.items()]
-    results = await asyncio.gather(*tasks)
+    tasks = [_fetch_single(name, obj) for name, obj in ccxt_instances.items()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     prices_map = {}
-    for name, tkrs in results:
+    for res in results:
+        if not isinstance(res, tuple): continue
+        name, tkrs = res
         if not tkrs: continue
         for sym, t in tkrs.items():
             if sym not in UNIVERSAL_SYMBOLS: continue
@@ -348,8 +354,11 @@ async def fetch_all_market_prices():
             if sym not in prices_map:
                 prices_map[sym] = {}
             prices_map[sym][name] = float(last)
-            
-    return {sym: p for sym, p in prices_map.items() if len(p) >= 2}
+
+    filtered = {sym: p for sym, p in prices_map.items() if len(p) >= 2}
+    async with CACHE_LOCK:
+        GLOBAL_PRICE_CACHE = filtered
+        LAST_PRICE_UPDATE = time.time()
 
 def calculate_net_arbitrage(symbol: str, prices: dict, trade_size_usd: float, loose_mode: bool = False):
     if len(prices) < 2: return None
@@ -359,8 +368,9 @@ def calculate_net_arbitrage(symbol: str, prices: dict, trade_size_usd: float, lo
     buy_price = prices[buy_ex]
     sell_price = prices[sell_ex]
 
+    if buy_price <= 0: return None
     coin_amount = trade_size_usd / buy_price
-    gross = coin_amount * sell_price - trade_size_usd
+    gross = (coin_amount * sell_price) - trade_size_usd
     buy_fee = trade_size_usd * EXCHANGE_CONFIG.get(buy_ex, {}).get('fee', 0.002)
     sell_fee = (coin_amount * sell_price) * EXCHANGE_CONFIG.get(sell_ex, {}).get('fee', 0.002)
     wd_fee = EXCHANGE_CONFIG.get(buy_ex, {}).get('withdraw_fees', {}).get(base, GENERIC_WITHDRAW_FEE_COIN_UNITS) * sell_price
@@ -400,27 +410,26 @@ def format_detailed_alert(arb: dict) -> str:
 • Coin Amount    : `{arb['coin_amount']:.6f}`"""
 
 async def get_orderbook_text(symbol: str) -> str:
-    known = list(SYMBOL_EXCHANGE_MAP.get(symbol, ccxt_instances.keys()))[:3]
+    known = list(SYMBOL_EXCHANGE_MAP.get(symbol, ccxt_instances.keys()))[:2]
     lines = [f"📖 **Order Book: {symbol}**\n"]
     for name in known:
         try:
-            ob = await asyncio.wait_for(ccxt_instances[name].fetch_order_book(symbol, limit=6), timeout=3.0)
+            ob = await asyncio.wait_for(ccxt_instances[name].fetch_order_book(symbol, limit=5), timeout=3.0)
             lines.append(f"**{name.upper()}**\nBuy (Bids):")
-            for p, v in ob.get('bids', [])[:5]: lines.append(f"`{p:.5f}` × {v:.4f}")
+            for p, v in ob.get('bids', [])[:4]: lines.append(f"`{p:.5f}` × {v:.4f}")
             lines.append("Sell (Asks):")
-            for p, v in ob.get('asks', [])[:5]: lines.append(f"`{p:.5f}` × {v:.4f}")
+            for p, v in ob.get('asks', [])[:4]: lines.append(f"`{p:.5f}` × {v:.4f}")
             lines.append("")
         except Exception:
             continue
-    if len(lines) <= 1: return f"Could not fetch order book for `{symbol}`"
+    if len(lines) <= 1: return f"Could not fetch order book for `{symbol}` right now."
     return "\n".join(lines)
 
-async def scan_all_symbols(min_profit=None, min_spread=None, max_spread=None, symbols=None, trade_size=100.0, loose_mode=False):
-    prices_map = await fetch_all_market_prices()
+def get_cached_arbitrage(min_profit=None, min_spread=None, max_spread=None, symbols=None, trade_size=100.0, loose_mode=False):
     results = []
     target_symbols = set(symbols) if symbols else None
 
-    for sym, prices in prices_map.items():
+    for sym, prices in GLOBAL_PRICE_CACHE.items():
         if target_symbols and sym not in target_symbols: continue
         arb = calculate_net_arbitrage(sym, prices, trade_size, loose_mode)
         if arb:
@@ -433,14 +442,14 @@ async def scan_all_symbols(min_profit=None, min_spread=None, max_spread=None, sy
     return results
 
 # ==========================================
-# 4. HANDLERS (Users)
+# 4. COMMAND HANDLERS
 # ==========================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     log_action(uid, "/start")
 
     if is_user_premium(uid):
-        kb = [[InlineKeyboardButton("⚡ Run Scan", callback_data="run_manual_scan"), InlineKeyboardButton("⚙️ Filters", callback_data="show_filters")]]
+        kb = [[InlineKeyboardButton("⚡ Instant Scan", callback_data="run_manual_scan"), InlineKeyboardButton("⚙️ Filters", callback_data="show_filters")]]
         exchange_names = " • ".join([k.capitalize() for k in ccxt_instances.keys()])
         text = f"""👑 **Arbitrage Terminal Active**
 
@@ -449,10 +458,11 @@ Exchanges ({len(ccxt_instances)}):
 {exchange_names}
 
 📌 **Quick Commands:**
-`/scan` - Find opportunities
-`/filters` - View settings
+`/scan` - Instant market opportunities
+`/filters` - View your settings & alerts status
 `/loosemode` - Toggle contract verification
 `/portfolio` - Paper trading stats
+`/pause` / `/resume` - Manage background alerts
 `/help` - Full command list"""
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else:
@@ -476,19 +486,18 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = get_user_settings(uid)
     if not settings: return await message.reply_text("Settings not found.")
 
-    status = await message.reply_text(f"🔍 Lightning Scan across {len(ccxt_instances)} exchanges...")
-    start_time = time.time()
-    results = await scan_all_symbols(
+    results = get_cached_arbitrage(
         min_profit=settings['min_net_profit_usd'], min_spread=settings['min_spread_pct'],
         max_spread=settings['max_spread_pct'], symbols=list(settings['watchlist']) if settings['watchlist'] else None,
         trade_size=settings['trade_size_usd'], loose_mode=settings['loose_mode']
     )
-    elapsed = time.time() - start_time
 
-    if not results: return await status.edit_text(f"No opportunities found (Took {elapsed:.1f}s).")
+    if not results:
+        age = int(time.time() - LAST_PRICE_UPDATE) if LAST_PRICE_UPDATE else 0
+        return await message.reply_text(f"🔍 No arbitrage opportunities meet your filter criteria (Market cache updated {age}s ago).")
 
     top = results[:settings['max_results']]
-    await status.edit_text(f"📊 Found **{len(results)}** opportunities in {elapsed:.1f}s (showing {len(top)})")
+    await message.reply_text(f"📊 Found **{len(results)}** opportunities (Showing top {len(top)}):", parse_mode="Markdown")
 
     for i, arb in enumerate(top, 1):
         text = f"**#{i}**\n" + format_detailed_alert(arb)
@@ -496,28 +505,26 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
               [InlineKeyboardButton("🎮 Paper Trade This!", callback_data=f"pt:{arb['net_profit']:.2f}")]]
         try:
             await message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.08)
         except Exception:
             pass
 
 async def loosemode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     log_action(uid, "/loosemode")
-    if not is_user_premium(uid): return await update.message.reply_text("🔒 Premium required.")
-    if toggle_loose_mode_db(uid):
-        await update.message.reply_text("🔓 **Loose Mode ENABLED**")
-    else:
-        await update.message.reply_text("🔒 **Loose Mode DISABLED**")
+    if not is_user_premium(uid): return
+    if toggle_loose_mode_db(uid): await update.message.reply_text("🔓 **Loose Mode ENABLED**")
+    else: await update.message.reply_text("🔒 **Loose Mode DISABLED**")
 
 async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     log_action(uid, "/portfolio")
-    if not is_user_premium(uid): return await update.message.reply_text("🔒 Premium required.")
+    if not is_user_premium(uid): return
     settings = get_user_settings(uid)
     await update.message.reply_text(f"🎮 **Your Paper Trading Portfolio**\n\nTotal Virtual Profit: **${settings['paper_balance']:.2f}**", parse_mode="Markdown")
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_user_premium(update.effective_user.id): return await update.message.reply_text("🔒 Premium required.")
+    if not is_user_premium(update.effective_user.id): return
     leaders = get_paper_leaderboard()
     if not leaders: return await update.message.reply_text("No paper trades recorded yet!")
     lines = ["🏆 **Paper Trading Leaderboard**\n"]
@@ -525,17 +532,18 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def orderbook_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_user_premium(update.effective_user.id): return await update.message.reply_text("🔒 Premium required.")
-    if not context.args: return await update.message.reply_text("⚠️ Usage:\n`/ob BTC/USDT`", parse_mode="Markdown")
-    msg = await update.message.reply_text(f"📖 Fetching order book...")
+    if not is_user_premium(update.effective_user.id): return
+    if not context.args: return await update.message.reply_text("⚠️ Usage:\n`/ob BTC/USDT`")
+    msg = await update.message.reply_text("📖 Fetching real-time order book...")
     await msg.edit_text(await get_orderbook_text(context.args[0].upper()), parse_mode="Markdown")
 
 async def filters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     log_action(uid, "/filters")
-    if not is_user_premium(uid): return await update.message.reply_text("🔒 Premium required.")
+    if not is_user_premium(uid): return
     s = get_user_settings(uid)
     text = f"""⚙️ **Your Settings**
+• Alerts Status: `{'PAUSED ⏸' if s['paused'] else 'ACTIVE ▶️'}`
 • Trade Size   : `${s['trade_size_usd']:.0f}`
 • Min Profit   : `${s['min_net_profit_usd']:.1f}`
 • Min Spread   : `{s['min_spread_pct']:.1f}%`
@@ -546,9 +554,13 @@ async def filters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_value(update, context, field, type_func, name):
     uid = update.effective_user.id
-    if not context.args: return await update.message.reply_text(f"⚠️ Value required.")
-    update_user_setting(uid, field, type_func(context.args[0]))
-    await update.message.reply_text(f"✅ {name} set to **{context.args[0]}**")
+    if not context.args: return await update.message.reply_text("⚠️ Value required.")
+    try:
+        val = type_func(context.args[0])
+        update_user_setting(uid, field, val)
+        await update.message.reply_text(f"✅ {name} set to **{val}**")
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid number.")
 
 async def setminprofit_command(update, context): await set_value(update, context, 'min_net_profit_usd', float, "Min net profit")
 async def setminspread_command(update, context): await set_value(update, context, 'min_spread_pct', float, "Min spread")
@@ -558,49 +570,50 @@ async def settradesize_command(update, context): await set_value(update, context
 
 async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_user_premium(uid): return await update.message.reply_text("🔒 Premium required.")
-    if not context.args: return await update.message.reply_text("⚠️ Usage:\n`/watch BTC/USDT`", parse_mode="Markdown")
+    if not is_user_premium(uid) or not context.args: return
     sym = context.args[0].upper()
-    conn = sqlite3.connect("arbitrage_users.db")
+    conn = get_db()
     try:
         conn.execute("INSERT INTO watchlist (user_id, symbol) VALUES (?, ?)", (uid, sym))
         conn.commit()
         await update.message.reply_text(f"✅ Added `{sym}` to watchlist.")
-    except Exception:
-        await update.message.reply_text(f"⚠️ Already in watchlist.")
-    finally:
-        conn.close()
+    except Exception: pass
+    finally: conn.close()
 
 async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_user_premium(uid): return await update.message.reply_text("🔒 Premium required.")
-    if not context.args: return await update.message.reply_text("⚠️ Usage:\n`/unwatch BTC/USDT`", parse_mode="Markdown")
+    if not is_user_premium(uid) or not context.args: return
     sym = context.args[0].upper()
-    conn = sqlite3.connect("arbitrage_users.db")
+    conn = get_db()
     conn.execute("DELETE FROM watchlist WHERE user_id = ? AND symbol = ?", (uid, sym))
     conn.commit()
     conn.close()
     await update.message.reply_text(f"🗑️ Removed `{sym}` from watchlist.")
 
-async def pause_command(update, context):
-    update_user_setting(update.effective_user.id, 'paused', 1)
-    await update.message.reply_text("⏸ Background alerts paused.")
+async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    log_action(uid, "/pause")
+    if not is_user_premium(uid):
+        return await update.message.reply_text("🔒 Premium required.")
+    update_user_setting(uid, 'paused', 1)
+    await update.message.reply_text("⏸ **Background alerts paused.**\n(You can still use `/scan` manually at any time.)", parse_mode="Markdown")
 
-async def resume_command(update, context):
-    update_user_setting(update.effective_user.id, 'paused', 0)
-    await update.message.reply_text("▶️ Background alerts resumed.")
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    log_action(uid, "/resume")
+    if not is_user_premium(uid):
+        return await update.message.reply_text("🔒 Premium required.")
+    update_user_setting(uid, 'paused', 0)
+    await update.message.reply_text("▶️ **Background alerts resumed.**", parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = """🤖 **Full Command List**
 🔍 **Core:** `/scan`, `/loosemode`, `/ob BTC/USDT`
 🎮 **Paper Trading:** `/portfolio`, `/leaderboard`
 ⚙️ **Filters:** `/filters`, `/settradesize`, `/setminprofit`, `/setminspread`, `/setmaxspread`, `/setmaxresults`
-🔔 **Watchlist:** `/watch`, `/unwatch`, `/pause`, `/resume`"""
+🔔 **Alert Controls:** `/watch`, `/unwatch`, `/pause`, `/resume`"""
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ==========================================
-# 5. ADMIN HANDLERS
-# ==========================================
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Unauthorized")
     users = get_all_users_detailed()
@@ -610,51 +623,8 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"`{u[0]}` @{u[1] or '—'} {status} | {u[9] or 'never'}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ `/userinfo secret user_id`")
-    try: target = int(context.args[1])
-    except ValueError: return await update.message.reply_text("Invalid ID")
-    info = get_user_full_info(target)
-    if not info: return await update.message.reply_text("User not found")
-    actions = "\n".join([f"`{a[1]}` → {a[0]}" for a in get_user_actions(target, 12)]) or "None"
-    text = f"""👤 `{info['user_id']}` @{info['username'] or '—'}
-Status: {'🚫 Banned' if info['is_banned'] else ('Premium' if info['is_premium'] else 'Normal')}
-Loose Mode: {'ON' if info['loose_mode'] else 'OFF'} | Paper Balance: ${info['paper_balance']:.2f}
-Last active: `{info['last_active']}`"""
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ `/ban secret user_id`")
-    conn = sqlite3.connect("arbitrage_users.db")
-    conn.execute("UPDATE users SET is_banned = 1, is_premium = 0 WHERE user_id = ?", (int(context.args[1]),)).connection.commit()
-    conn.close()
-    await update.message.reply_text(f"🚫 User `{context.args[1]}` banned.")
-
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ `/unban secret user_id`")
-    conn = sqlite3.connect("arbitrage_users.db")
-    conn.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (int(context.args[1]),)).connection.commit()
-    conn.close()
-    await update.message.reply_text(f"✅ User `{context.args[1]}` unbanned.")
-
-async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ `/revoke secret user_id`")
-    uid = int(context.args[1])
-    conn = sqlite3.connect("arbitrage_users.db")
-    conn.execute("UPDATE users SET is_premium = 0, is_banned = 0 WHERE user_id = ?", (uid,))
-    conn.execute("UPDATE access_keys SET is_used = 0, used_by = NULL WHERE used_by = ?", (uid,)).connection.commit()
-    conn.close()
-    await update.message.reply_text(f"🔒 Access of `{uid}` revoked.")
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Unauthorized")
-    users = get_all_users_detailed()
-    prem = sum(1 for u in users if u[2] and not u[3])
-    banned = sum(1 for u in users if u[3])
-    await update.message.reply_text(f"📊 Total: {len(users)} | Premium: {prem} | Banned: {banned} | Pairs: {len(UNIVERSAL_SYMBOLS)}")
-
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Unauthorized")
+    if not context.args or context.args[0] != ADMIN_SECRET: return
     msg = " ".join(context.args[1:])
     ok = fail = 0
     for uid in get_all_premium_users():
@@ -662,70 +632,11 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(uid, f"📢 **Admin Message**\n\n{msg}", parse_mode="Markdown")
             ok += 1
             await asyncio.sleep(0.04)
-        except Exception:
-            fail += 1
+        except Exception: fail += 1
     await update.message.reply_text(f"✅ Sent: {ok} | Failed: {fail}")
 
-async def sendto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 3 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ `/sendto secret user_id message`")
-    try:
-        await context.bot.send_message(int(context.args[1]), f"🔒 **Admin Message**\n\n{' '.join(context.args[2:])}", parse_mode="Markdown")
-        await update.message.reply_text("✅ Sent")
-    except Exception as e: await update.message.reply_text(f"❌ {e}")
-
-async def generate_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Unauthorized")
-    key = context.args[1]
-    conn = sqlite3.connect("arbitrage_users.db")
-    conn.execute("INSERT OR IGNORE INTO access_keys (key_code) VALUES (?)", (key,)).connection.commit()
-    conn.close()
-    await update.message.reply_text(f"✅ New key created:\n`{key}`", parse_mode="Markdown")
-
-async def givepremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Usage: `/givepremium secret user_id`")
-    try:
-        target_uid = int(context.args[1])
-        conn = sqlite3.connect("arbitrage_users.db")
-        conn.execute("INSERT OR IGNORE INTO users (user_id, is_premium, registered_at) VALUES (?, 1, ?)", (target_uid, now_ist()))
-        conn.execute("UPDATE users SET is_premium = 1, is_banned = 0 WHERE user_id = ?", (target_uid,)).connection.commit()
-        conn.close()
-        await update.message.reply_text(f"✅ Successfully granted premium access to user `{target_uid}`.", parse_mode="Markdown")
-    except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
-
-async def deluser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2 or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Usage: `/deluser secret user_id`")
-    try:
-        target_uid = int(context.args[1])
-        conn = sqlite3.connect("arbitrage_users.db")
-        conn.execute("DELETE FROM users WHERE user_id = ?", (target_uid,))
-        conn.execute("DELETE FROM watchlist WHERE user_id = ?", (target_uid,))
-        conn.execute("DELETE FROM user_actions WHERE user_id = ?", (target_uid,)).connection.commit()
-        conn.close()
-        await update.message.reply_text(f"🗑️ User `{target_uid}` completely wiped.", parse_mode="Markdown")
-    except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
-
-async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or context.args[0] != ADMIN_SECRET: return await update.message.reply_text("⛔ Usage: `/backup secret`")
-    try:
-        await update.message.reply_document(document=open("arbitrage_users.db", "rb"), filename=f"arbitrage_backup_{int(time.time())}.db")
-    except Exception as e: await update.message.reply_text(f"❌ Failed: {e}")
-
 # ==========================================
-# 6. HEALTH SERVER
-# ==========================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is healthy!")
-    def log_message(self, format, *args): pass
-
-def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    HTTPServer(('0.0.0.0', port), HealthCheckHandler).serve_forever()
-
-# ==========================================
-# 7. ROUTER & DAEMON
+# 5. BUTTON ROUTER & BACKGROUND DAEMON
 # ==========================================
 async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -751,31 +662,34 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"✅ Paper traded! Earned ${prof:.2f}", show_alert=True)
 
 async def background_daemon(app):
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
     await load_universal_symbols()
     last_refresh = time.time()
+
     while True:
         try:
             if time.time() - last_refresh > CURRENCY_REFRESH_SECONDS:
                 await load_universal_symbols()
                 last_refresh = time.time()
 
+            await refresh_global_prices()
             users = get_all_premium_users()
-            if users and UNIVERSAL_SYMBOLS:
-                prices_map = await fetch_all_market_prices()
+
+            if users and GLOBAL_PRICE_CACHE:
                 for uid in users:
                     settings = get_user_settings(uid)
                     if not settings or settings['paused'] or settings['is_banned']: continue
-                    alerts = []
-                    for sym, prices in prices_map.items():
-                        if settings['watchlist'] and sym not in settings['watchlist']: continue
-                        arb = calculate_net_arbitrage(sym, prices, settings['trade_size_usd'], settings['loose_mode'])
-                        if (arb and arb['net_profit'] >= settings['min_net_profit_usd'] and
-                            arb['net_spread_pct'] >= settings['min_spread_pct'] and arb['net_spread_pct'] <= settings['max_spread_pct']):
-                            alerts.append(arb)
-                            
-                    alerts.sort(key=lambda x: x['net_profit'], reverse=True)
-                    for arb in alerts[:5]:
+                    
+                    alerts = get_cached_arbitrage(
+                        min_profit=settings['min_net_profit_usd'],
+                        min_spread=settings['min_spread_pct'],
+                        max_spread=settings['max_spread_pct'],
+                        symbols=list(settings['watchlist']) if settings['watchlist'] else None,
+                        trade_size=settings['trade_size_usd'],
+                        loose_mode=settings['loose_mode']
+                    )
+
+                    for arb in alerts[:3]:
                         kb = [[InlineKeyboardButton("📖 View Order Book", callback_data=f"ob:{arb['symbol']}")],
                               [InlineKeyboardButton("🎮 Paper Trade This!", callback_data=f"pt:{arb['net_profit']:.2f}")]]
                         try:
@@ -783,10 +697,13 @@ async def background_daemon(app):
                             await asyncio.sleep(0.5)
                         except Exception:
                             pass
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
         except Exception as e:
-            print(f"Daemon error: {e}")
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+            logger.error(f"Daemon non-fatal error: {e}")
+
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Telegram Exception caught: {context.error}")
 
 async def post_init(app):
     global ccxt_instances
@@ -794,7 +711,7 @@ async def post_init(app):
         if hasattr(ccxt_async, ex_id):
             ccxt_instances[ex_id] = getattr(ccxt_async, ex_id)(config)
             
-    print("✅ High-speed CCXT instances bound.")
+    logger.info("CCXT Exchange instances initialized successfully.")
     asyncio.create_task(background_daemon(app))
 
 async def post_shutdown(app):
@@ -806,9 +723,17 @@ async def post_shutdown(app):
 
 def main():
     init_db()
-    threading.Thread(target=run_health_server, daemon=True).start()
     
-    app = ApplicationBuilder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout(30).post_init(post_init).post_shutdown(post_shutdown).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .connect_timeout(20)
+        .read_timeout(20)
+        .write_timeout(20)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     handlers = [
         ("start", start_command), ("register", register_command), ("help", help_command),
@@ -818,17 +743,15 @@ def main():
         ("setmaxspread", setmaxspread_command), ("setmaxresults", setmaxresults_command),
         ("settradesize", settradesize_command), ("pause", pause_command), ("resume", resume_command),
         ("watch", watch_command), ("unwatch", unwatch_command),
-        
-        ("users", users_command), ("userinfo", userinfo_command), ("ban", ban_command),
-        ("unban", unban_command), ("revoke", revoke_command), ("stats", stats_command),
-        ("broadcast", broadcast_command), ("sendto", sendto_command), ("generatekey", generate_key_command),
-        ("givepremium", givepremium_command), ("deluser", deluser_command), ("backup", backup_command)
+        ("users", users_command), ("broadcast", broadcast_command)
     ]
-    for cmd, func in handlers: app.add_handler(CommandHandler(cmd, func))
+    for cmd, func in handlers:
+        app.add_handler(CommandHandler(cmd, func))
 
     app.add_handler(CallbackQueryHandler(button_router))
+    app.add_error_handler(global_error_handler)
     
-    print("Bot started with drop_pending_updates enabled...")
+    logger.info("Bot started with drop_pending_updates & cache engine enabled...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
